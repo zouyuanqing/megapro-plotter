@@ -1,0 +1,11 @@
+# GUI 上位机额外依赖（核心仍只用 requirements-m0.txt 的 pyserial）
+PySide6==6.11.2
+fonttools==4.63.0
+Pillow==12.2.0
+# 图片→中心线边缘提取（骨架化，替代 potrace 双线轮廓）
+opencv-python>=4.10
+scikit-image>=0.24
+numpy>=1.26
+# 排版页 Word/Excel 导入
+python-docx>=1.1
+openpyxl>=3.1

@@ -1,0 +1,7 @@
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest_tmp/
+.zcode/
+presets/

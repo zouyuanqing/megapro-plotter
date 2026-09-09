@@ -1,0 +1,15 @@
+port: COM7
+baud: 250000
+firmware: "Marlin 1.1.0-RC8 (Github) SOURCE_CODE_URL:https://github.com/MarlinFirmware/Marlin PROTOCOL_VERSION:1.0 MACHINE_TYPE:3D Printer EXTRUDER_COUNT:1 UUID:cede2a2f-4"
+pen: z-lift
+pen_lift_z: "1.0"
+pen_down_z: "17.0"
+safe_x: 0.0
+safe_y: 50.0
+safe_z: 30.0
+servo: m280-only-if-probe-responds
+work_area: "{x: 210, y: 210, z: 205}"
+notes: "pen_down_z=17.0 = absolute Z at which pen just touches paper, live-verified 2026-09-07 (two runs: Z30 safe -> down 13 -> Z17 touch). Pen is friction-fit (no spring). safe_z 30.0 = lift height used in the trial, down from the older 40."
+cut_touch_z: "17.5"
+raw: |
+  |

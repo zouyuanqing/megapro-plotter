@@ -3,6 +3,8 @@
 管线（研究结论 2026-09）：预滤波 → 骨架化(thin) → 骨架图追踪成折线 → SVG。
 - 骨架化：skimage.morphology.thin → 1px 中心线。
 - 追踪：自写骨架图游走（分支点断开成路径），不依赖 skan 易变 API。
+- 照片/素描模式（PRD FR-10）：`cv2.Canny` 边缘图 → 同样 thin → 同样游走，
+  只是前段用梯度边缘代替阈值二值（见文末 `trace_centerline_canny`）。
 输出 mm 描边折线 SVG（y-down；由排版/作业按坐标约定处理）。
 （DL 检测器曾接入后因效果不佳回滚移除，仅保留纯算法中心线。）
 """
@@ -12,7 +14,9 @@ from __future__ import annotations
 from pathlib import Path
 
 __all__ = ["trace_centerline", "trace_centerline_multi",
-           "image_to_centerline_svg", "image_to_centerline_svg_multi"]
+           "image_to_centerline_svg", "image_to_centerline_svg_multi",
+           "CANNY_LOW", "CANNY_HIGH", "CANNY_APERTURE",
+           "trace_centerline_canny", "image_to_canny_centerline_svg"]
 
 import numpy as np
 
@@ -222,3 +226,98 @@ def image_to_centerline_svg_multi(img, *, target_mm: float = 180.0,
 
 def _fmt(v: float) -> str:
     return f"{v:.3f}".rstrip("0").rstrip(".")
+
+
+# ---------------------------------------------------------------------------
+# 照片/素描模式（PRD FR-10 算法部分）：Canny → thin → 游走 → 简化
+# ---------------------------------------------------------------------------
+#
+# 三个默认参数由 `tests/test_gui_edge.py` 的**合成样张 golden** 定基线
+# （PRD §11-3：low/high、aperture 以 golden 定基线，真机调优**需现场**）。
+# 取值理由（样张 = 240×288：上带纹理噪声 + 低对比软斑 + 硬边圆 + 硬边三角）：
+#
+# - ``aperture_size=3``（cv2 默认 Sobel）：实测 5 / 7 在带纹理的样张上把噪声
+#   放大成 740 / 730 条碎路径（其中 732 / 632 条全在噪声带上）——大核把高频
+#   纹理当边缘。3 是唯一稳定档，故锁死。cv2 自行校验只接受 3/5/7（传 4/9/1
+#   直接抛错），故本模块不再重复校验。
+# - ``low=50``：**噪声抑制的下界**。实测 low=45 时顶部纹理带冒出 2 条假线
+#   （共 5 条），low=50 起干净；而 (50,120)/(60,140)/(70,160)/(80,180)/
+#   (100,200)/(50,200) **六组输出逐位相同**（各 3 条 85 点），故取 50 ——
+#   白拿低对比软边，不付噪声代价。
+# - ``high=120``：取同一稳定平台的**低端**（120~200 输出逐位相同），偏向
+#   低对比边缘；再往上只会丢软边不换任何东西。
+#
+# 整段刻意**不引入**任何新依赖：cv2 / skimage / numpy 均为
+# requirements-gui.txt:5-7 已声明（opencv-python>=4.10 / scikit-image>=0.24）。
+CANNY_LOW = 50
+CANNY_HIGH = 120
+CANNY_APERTURE = 3
+
+
+def _paths_from_skel(skel, simplify_tol: float) -> list:
+    """1px 骨架图 → 折线列表（游走 + DP 简化），像素 (x, y)。
+
+    与 `_trace_one`(:135) 的「二值 → thin → 游走 → 简化」同构，只是把
+    前段的阈值二值换成调用方给的骨架图。**刻意不抽公共函数去改
+    `_trace_one`** —— 本里程碑只新增、不改既有函数。
+    """
+    out = []
+    for p in _skeleton_paths(skel):
+        pts = _dp_simplify([(float(x), float(y)) for (y, x) in p], simplify_tol)
+        if len(pts) >= 2:
+            out.append(pts)
+    return out
+
+
+def trace_centerline_canny(img, *, max_px: int = 1200,
+                           low: int = CANNY_LOW, high: int = CANNY_HIGH,
+                           aperture_size: int = CANNY_APERTURE,
+                           simplify_tol: float = 0.8):
+    """照片/素描 → **单像素宽**中心线折线（像素 (x, y)），PRD FR-10。
+
+    管线：`cv2.Canny` 边缘图 → `skimage.morphology.thin` 骨架化 → 复用
+    `_skeleton_paths`(:57) 游走 + `_dp_simplify`(:105) 简化。与既有的
+    `trace_centerline`(:151) 唯一区别是**前段**：阈值二值 → Canny 梯度边缘，
+    故对明暗渐变/低对比（照片、素描）比单一阈值更宽容。
+
+    **为什么不用 findContours / approxPolyDP**（PRD FR-10 明文否决）：
+    Canny 输出的是 1px 边缘**带**，findContours 沿带两侧各描一条轮廓。实测
+    r=60 圆：同一张 1px 带上 `findContours` 返 **2 条** 336/340 点轮廓
+    ≈ 双线，而本函数返 **1 条 338 点**路径（恰等于骨架像素数，即每个骨架
+    像素只走一次）。这与本文件 :1-8 docstring 立管的「消双线」目标直接冲突。
+
+    **已知边界（实测，勿当 bug 也勿当特性）**：**实心笔画** Canny 只看得见它
+    的两条轮廓边 —— 1px 横线（长 250px）的 edge_px 实测 504 ≈ 2× 线长，宽笔画
+    同理。thin 无法合并相距 >2px 的两条 1px 线，于是走一圈 = 沿轮廓来回各画
+    一遍（视觉上仍是两条平行笔迹）。要宽笔画的真中心线请用 `trace_centerline`
+    （阈值二值 → thin，把笔画当实心区域）。本函数覆盖的是照片/素描的**区域
+    轮廓**与细线，正是 FR-10 的场景。
+
+    ``low > high`` 抛 ValueError：当前 OpenCV 自己会把两值归一化（不报错、
+    输出不变），此处是给即将接线的加图对话框（可手输阈值）一个显式契约。
+    """
+    import cv2
+    from skimage.morphology import thin
+
+    if low > high:
+        raise ValueError(f"Canny low 不得大于 high: low={low}, high={high}")
+
+    arr = _preprocess_gray(img)
+    h, w = arr.shape
+    scale = min(1.0, max_px / max(h, w))
+    if scale < 1.0:
+        arr = _resize(arr, scale)
+    edges = cv2.Canny(arr, low, high, apertureSize=aperture_size) > 0
+    return _paths_from_skel(thin(edges), simplify_tol)
+
+
+def image_to_canny_centerline_svg(img, *, target_mm: float = 180.0,
+                                  max_px: int = 1200,
+                                  low: int = CANNY_LOW, high: int = CANNY_HIGH,
+                                  aperture_size: int = CANNY_APERTURE,
+                                  simplify_tol: float = 0.8) -> str:
+    """照片/素描 → 中心线 SVG（**Canny+骨架**模式，FR-10 接线用出口）。"""
+    paths = trace_centerline_canny(img, max_px=max_px, low=low, high=high,
+                                   aperture_size=aperture_size,
+                                   simplify_tol=simplify_tol)
+    return _paths_to_svg(paths, target_mm)

@@ -23,7 +23,7 @@ from megapro.gui.text_to_svg import (
     find_cjk_font, text_outline_svg, text_singleline_svg,
 )
 
-__all__ = ["extract_docx", "extract_xlsx", "DocImportDialog"]
+__all__ = ["extract_docx", "extract_xlsx", "wrap_group", "DocImportDialog"]
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
 _MM_PER_PT = 25.4 / 72.0  # 磅 → mm
@@ -182,6 +182,27 @@ def _finish(items: list[Item]) -> list[Item]:
         it.paths = paths
         normalize_local(it)
     return items
+
+
+def wrap_group(items, *, name: str = "组") -> Item:
+    """恒等容器包装：把一组 Item 原样收进一个容器（FR-07 / D4）。
+
+    容器恒为**恒等变换**（``paths=[]``、``pos=(0,0)``、``scale=1.0``、
+    ``angle_deg=0.0``），``children`` = 原 Item 集（同一批对象，列表拷贝）；
+    子项数据零改写 —— 由 FR-01 的「父恒等 ∘ 子」合成数学保证
+    ``flatten_visible([容器])`` 与 ``flatten_visible(平铺列表)`` 逐点等价
+    （含折线顺序、z 序口径）。
+
+    **组变换不走容器**（v1.2 裁决：扁平场景下容器变换无渲染通路，组移动/缩放/
+    旋转 = 叶子集合的一条命令，见 FR-04/FR-05）；``z`` 取 0 且**不参与拍平
+    排序**（FR-02）。
+
+    本函数**不改** :func:`_finish` / ``extract_docx`` / ``extract_xlsx`` 的平铺
+    返回契约（冻结用例 ``test_gui_doc_import.py`` 依赖顶层名字查找与
+    ``len(items) >= 3``）；调用侧接线（``layout_page._add_doc``）随 M2/T7b。
+    """
+    return Item(paths=[], pos=(0.0, 0.0), scale=1.0, angle_deg=0.0,
+                name=name, z=0.0, children=list(items))
 
 
 class DocImportDialog(QtWidgets.QDialog):

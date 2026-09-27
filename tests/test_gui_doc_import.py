@@ -7,7 +7,8 @@ import pytest
 pytest.importorskip("docx")
 pytest.importorskip("openpyxl")
 
-from megapro.gui.layout.doc_import import extract_docx, extract_xlsx
+from megapro.gui.layout.doc_import import extract_docx, extract_xlsx, wrap_group
+from megapro.gui.layout.model import Document, Item, flatten_visible
 
 
 def _make_docx(path: Path):
@@ -133,3 +134,64 @@ def test_extract_docx_group_layout_preserved(tmp_path):
         for pl in it.transformed_paths():
             for x, y in pl:
                 assert 0 <= x <= 210 and 0 <= y <= 210
+
+
+# --- M1：wrap_group 恒等容器包装（FR-07 / D4） -------------------------------
+#
+# 上方 6 个既有用例一字不改保绿 = extract 平铺返回契约未变（顶层名字查找、
+# len(items) >= 3）。以下是纯函数 + 等价 golden。
+
+
+def test_wrap_group_is_identity_container():
+    a = Item(paths=[[(0.0, 0.0), (1.0, 0.0)]], name="a")
+    g = wrap_group([a])
+    assert g.paths == []
+    assert g.pos == (0.0, 0.0)
+    assert g.scale == 1.0
+    assert g.angle_deg == 0.0
+    assert g.is_container()
+    # children = 原 Item 集（同一批对象，身份不变 → undo/场景可继续引用）
+    assert len(g.children) == 1 and g.children[0] is a
+    # 容器 z 不参与拍平（FR-02），此处取默认 0
+    assert g.z == 0.0
+
+
+def _flat_reference(items):
+    """按**叶子自身 z 稳定序**展开的期望拍平结果（不依赖模型递归实现）。"""
+    return [p for it in sorted(items, key=lambda it: it.z)
+            for p in it.transformed_paths() if len(p) >= 2]
+
+
+def test_wrap_group_docx_equivalence_pointwise(tmp_path):
+    """FR-07 验收②：对 extract_docx 产物，包装前后拍平**含折线顺序**逐点恒等。"""
+    items = extract_docx(_make_docx(tmp_path / "t.docx"), mode="outline",
+                         size_mm=5.0)
+    flat = flatten_visible(Document(items=items))
+    wrapped = flatten_visible(Document(items=[wrap_group(items)]))
+    assert wrapped == flat  # 恒等包装：逐点精确相等（含顺序）
+    assert wrapped == _flat_reference(items)  # z 序口径（非列表序）
+
+
+def test_wrap_group_xlsx_equivalence_pointwise(tmp_path):
+    items = extract_xlsx(_make_xlsx(tmp_path / "t.xlsx"), mode="outline",
+                         size_mm=5.0)
+    flat = flatten_visible(Document(items=items))
+    wrapped = flatten_visible(Document(items=[wrap_group(items)]))
+    assert wrapped == flat
+    assert wrapped == _flat_reference(items)
+
+
+def test_wrap_group_preserves_z_stable_order():
+    """z 序 ≠ 列表序（§12 #7）：z=[0,1,0,1,1,1,1] → 稳定序索引 [0,2,1,3,4,5,6]。
+
+    容器 z 不参与排序，故包装后仍是同一条 z 序；这里用 x 坐标当身份标记。
+    """
+    items = [Item(paths=[[(float(i), 0.0), (float(i) + 0.5, 0.0)]],
+                 name=f"i{i}", z=float(z))
+             for i, z in enumerate((0, 1, 0, 1, 1, 1, 1))]
+    expect = [0.0, 2.0, 1.0, 3.0, 4.0, 5.0, 6.0]  # z 稳定序，不是列表序
+    assert [pl[0][0] for pl in flatten_visible(Document(items=items))] == expect
+    g = wrap_group(items, name="G")
+    g.z = -5.0  # 容器 z 不得抢到最下层
+    assert [pl[0][0] for pl in
+            flatten_visible(Document(items=[g]))] == expect

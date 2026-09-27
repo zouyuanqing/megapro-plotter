@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from megapro.gui.canvas.snap import SnapEngine
+from megapro.gui.canvas.snap import SnapEngine, snap_candidate_paths
 from megapro.gui.layout.model import Item
 
 __all__ = ["PathItem"]
@@ -96,19 +96,24 @@ class PathItem(QtWidgets.QGraphicsPathItem):
     def _snap_value(self, v: QtCore.QPointF) -> QtCore.QPointF:
         """拖动位置吸附（Q4）：对象吸附（端点/中点/边）优先，其次网格。
 
-        对象候选 = 其余图元的页面关键点（transformed_paths 即时计算；评审
-        low #3②：旧实现只做网格取整）。pitch = page.snap_pitch（随缩放 =
-        grid_steps 的 minor，见 layout_page._sync_snap_pitch）。
+        对象候选 = 其余图元的**页面系**关键点（FR-06 前置修复：候选源切
+        :func:`snap_candidate_paths` 的页面域 —— ``transformed_paths`` 即时
+        计算）。旧实现遍历 ``doc.items`` 拿 ``it.paths``（**局部**坐标）而喂入
+        的是页面坐标 ``v``，域不一致：``pos=(50,60)`` 的图元页面点 (51,61)
+        对局部候选零命中、对页面域命中 (51.0,60.0)；且 ``doc.items`` 漏掉
+        **组内叶子**（不在顶层列表里）并把**隐藏图元**也算进候选。
+
+        pitch = page.snap_pitch（随缩放 = grid_steps 的 minor，见
+        layout_page._sync_snap_pitch）。
         """
         page = getattr(self, "_page", None)
         if page is None or not getattr(page, "snap_enabled", False):
             return v
         pitch = float(getattr(page, "snap_pitch", 0.0) or 0.0)
         engine = SnapEngine(pitch, enabled=True)
-        others = [p for it in getattr(page, "doc").items
-                  if it is not self.model_item
-                  for p in it.transformed_paths()]
-        x, y = engine.snap((float(v.x()), float(v.y())), others)
+        x, y = engine.snap((float(v.x()), float(v.y())),
+                           snap_candidate_paths(getattr(page, "doc", None),
+                                                exclude=self.model_item))
         return QtCore.QPointF(x, y)
 
     def itemChange(self, change, value):  # noqa: N802
@@ -142,8 +147,12 @@ class PathItem(QtWidgets.QGraphicsPathItem):
         self.commit_move()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        """双击文字项 → 通知排版页重编（page.edit_text_item 回调）。"""
+        """双击：先问排版页（组编辑态进入），否则重编文字（page.edit_text_item 回调）。"""
         page = getattr(self, "_page", None)
+        if page is not None and getattr(page, "on_item_double_clicked", None):
+            if page.on_item_double_clicked(self.model_item):
+                event.accept()
+                return
         if page is not None and self.model_item.text_spec:
             page.edit_text_item(self.model_item)
             event.accept()

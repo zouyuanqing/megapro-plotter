@@ -33,42 +33,41 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
   ``shape().isEmpty()=False``）。故场景项必须按 :func:`iter_leaves` 建
   （**须显式 ``visible_only=False``**，见下「iter_leaves 默认值」）。
 
-  ⚠ **「跳过容器」不够，只跳过容器会双重切割**（M1 评审实测，见
-  :func:`iter_leaves` 与 :meth:`Document.contains` 的回归用例）：叶子在
-  容器里时**不在** ``doc.items`` 顶层列表中（身份判定），故
-  ``canvas/undo_cmds.py:make_gi`` 现写的 ``if item not in page.doc.items:
-  page.doc.add(item)``（:54-55）会把**每一个组内叶子**当成新图元追加成
-  第二个顶层 Item。实跑：``doc.items = ['G','a','b']``、``flatten_visible``
-  吐 4 条折线而真实几何单元只有 2 条 —— **同一几何被切两遍**，对切纸机
-  即重复下刀。正确的 M2 改法是把**渲染单元**与**模型归属**分开：
-  - 渲染：按 :func:`iter_leaves` 建 ``PathItem``，容器跳过；
+  ⚠ **「跳过容器」不够，只跳过容器会双重切割**（M1 评审实测，**M2 已修**）：
+  叶子在容器里时**不在** ``doc.items`` 顶层列表中（身份判定），故旧版
+  ``canvas/undo_cmds.py:make_gi`` 的 ``if item not in page.doc.items:
+  page.doc.add(item)`` 会把**每一个组内叶子**当成新图元追加成第二个顶层 Item。
+  实跑：``doc.items = ['G','a','b']``、``flatten_visible`` 吐 4 条折线而真实几何
+  单元只有 2 条 —— **同一几何被切两遍**，对切纸机即重复下刀。现版把**渲染单元**
+  与**模型归属**分开：
+  - 渲染：按 :func:`iter_leaves` 建 ``PathItem``，容器跳过（``make_gi`` 对
+    ``is_container()`` 返回 ``None``）；
   - 入模：``doc.add`` 只在**确无归属**时执行，判据用 :meth:`Document.contains`
     （全树身份查找），**不是**「是否在顶层列表」。
 
   组变换只写叶子集合（FR-04/FR-05），容器变换恒为恒等。
-- **删除/复原的归属契约（M1 立，M2 接线）**：:meth:`Document.remove` **组感知**
-  （按身份定位 owning container 并从其 children 摘除）并返回 :class:`DetachInfo`
-  （原容器 + 原下标），:meth:`Document.attach` 为其逆。**两者必须成对使用**：
-  只组感知而不把归属信息带回 undo 侧，``make_gi`` 仍会把摘下的叶子
-  ``doc.add`` 成顶层项 → **组被静默解散**（实测：摘除 a 后 ``make_gi(lp,a)``
-  得 ``doc.items=['G','a']``、``G.children=['b']``，无异常）。原「抛 ValueError」
-  方案已推翻：它让 ``QUndoStack`` 半污染（命令入栈、模型未改）且 Ctrl+Z 后
-  几何翻倍，比静默更差。
-- **已知缺口：``page_bbox()`` 不走祖先链（属 M2，M1 无法在本文件内修）**。
-  :meth:`Item.page_bbox` 只过自身变换，而 :func:`flatten_visible` 过祖先链 ——
-  对**带非恒等变换的容器下的叶子**，两者给出不同的页面坐标。实跑：
+- **删除/复原的归属契约**：:meth:`Document.remove` **组感知**（按身份定位 owning
+  container 并从其 children 摘除）并返回 :class:`DetachInfo`（原容器 + 原下标），
+  :meth:`Document.attach` 为其逆。**两者必须成对使用**：只组感知而不把归属信息
+  带回 undo 侧，场景重建会把摘下的叶子 ``doc.add`` 成顶层项 → **组被静默解散**
+  （实测：摘除 a 后重建得到 ``doc.items=['G','a']``、``G.children=['b']``，无异常）。
+  原「抛 ValueError」方案已推翻：它让 ``QUndoStack`` 半污染（命令入栈、模型未改）
+  且 Ctrl+Z 后几何翻倍，比静默更差。**M2 已接线**：``RemoveItemsCommand`` /
+  ``ClearCommand`` 收集回执、undo 侧 ``attach`` 回原容器；
+  ``Document.attach`` 的顶层分支也已改为**按 index 插入**（旧实现忽略 index、
+  恒追加到末尾 ⇒ 顶层序无法复原）。
+- **``page_bbox()`` 不走祖先链 —— M2 已补正消费侧**。:meth:`Item.page_bbox` 只过
+  自身变换，而 :func:`flatten_visible` 过祖先链 —— 对**带非恒等变换的容器下的
+  叶子**，两者给出不同的页面坐标。实跑：
   ``leaf(pos=(10,20))`` 在 ``container(pos=(100,0))`` 下，``flatten`` 给
-  ``(110,20)``，``leaf.page_bbox()`` 给 ``(10,20)``、``cont.page_bbox()`` 给
-  ``(110,20)``。而 ``layout_page.py:981-982`` 的越界预检正是
-  ``for it in doc.items_visible(): it.page_bbox()`` —— 枚举面拿不到祖先链
-  （``Item`` 无 ``parent`` 反向指针，:func:`iter_flattens` 产出的是
-  ``(item, paths, chain)`` 三元组而非带 ``page_bbox`` 的单元），故实跑一个
-  真实 x 范围 250..300（超 210 床）的图元时**所有上报 bbox 都在床内、越界
-  警告永不触发**，形成「导出切了 / 预检没报」分叉。M1 不能修：修法要么给
-  ``Item`` 加 ``parent`` 反向指针（新字段，须重想 ``eq=False`` 之外的构造与
-  剪贴板白名单语义），要么改 ``layout_page.py:981-982`` 消费单元 —— 两者都
-  越出本里程碑边界。**M2 必须处理**，组框 overlay（FR-05 按容器 page_bbox）
-  与吸附候选（FR-06 按页面域）都会撞上。容器恒等时（当前产品路径）不触发。
+  ``(110,20)``，``leaf.page_bbox()`` 给 ``(10,20)``。``Item`` 无 ``parent``
+  反向指针，故本方法本身**仍只含自身变换**（改它须加 parent 字段，超边界）；
+  **M2 的做法是不改它、而是给消费侧一条带祖先链的通道**：
+  :func:`iter_units`（产出 ``(item, chain)``）+ :meth:`Item.unit_page_bbox` /
+  :func:`unit_paths`。越界预检（``layout_page._on_export``）、组框 overlay、
+  对齐/分布、多选数值、吸附候选**全部改走新通道** ⇒ 「导出切了 / 预检没报」
+  的分叉消除（M2 用例钉住 ``unit_page_bbox`` 给 (110,20) 而裸 ``page_bbox``
+  给 (10,20)）。容器恒等时（当前产品路径）两者逐位相同。
 - **``iter_leaves`` 默认值**：``visible_only`` 默认 **False**（枚举面要的是
   「全部渲染单元」，可见性过滤是 :func:`flatten_visible` 的活）。默认 True 会
   与 ``make_gi`` 的 ``gi.setVisible(item.visible)``（:51）冲突：隐藏叶子的
@@ -101,6 +100,10 @@ __all__ = [
     "iter_items",
     "iter_leaves",
     "iter_flattens",
+    "iter_ancestors",
+    "iter_units",
+    "unit_paths",
+    "effectively_visible",
     "normalize_local",
     "flatten_visible",
     "MAX_TREE_DEPTH",
@@ -222,8 +225,9 @@ class Item:
         对**带非恒等变换的容器下的叶子**，本方法给的不是页面坐标：实跑
         ``leaf(pos=(10,20))`` 在 ``container(pos=(100,0))`` 下，
         ``flatten_visible`` 给 ``(110,20)`` 而本方法给 ``(10,20)``。
-        ``Item`` 无 ``parent`` 反向指针，本方法在 M1 内无法走祖先链；``_on_export``
-        的越界预检（``layout_page.py:981-982``）因此在编组后会漏报，属 M2。
+        ``Item`` 无 ``parent`` 反向指针，本方法无法走祖先链 —— **M2 的消费侧
+        必须改用** :func:`iter_units` / :meth:`unit_page_bbox`（自带祖先链），
+        不可再直接吃本方法。
 
         **无 children 的叶子语义逐位不变**（既有 golden 钉死）：其祖先链为空，
         自身变换即页面变换。
@@ -234,6 +238,31 @@ class Item:
         if not xs:
             return (0.0, 0.0, 0.0, 0.0)
         return (min(xs), min(ys), max(xs), max(ys))
+
+    def unit_page_bbox(self,
+                       chain: tuple["Item", ...] = ()) -> tuple[float, float, float, float]:
+        """本单元的**页面系** bbox —— 含祖先链（``chain`` 根在前）。
+
+        M2 修 M1 缺口 #1（``page_bbox()`` 不走祖先链）而设：越界预检
+        （``layout_page._on_export``）、组框 overlay、对齐/分布的 bbox 全部
+        改吃本方法，故「导出切了 / 预检没报」的分叉消除。
+
+        祖先链由 :func:`iter_units` 携带；``chain=()`` 时与 :meth:`page_bbox`
+        逐位相同（叶子文档、恒等容器 —— 当前产品路径）。
+        """
+        paths = unit_paths(self, chain)
+        xs = [x for p in paths for x, _ in p]
+        ys = [y for p in paths for _, y in p]
+        if not xs:
+            return (0.0, 0.0, 0.0, 0.0)
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def descendants(self) -> list["Item"]:
+        """自身 + 全部后代（DFS，前序）。含自身便于「组选中 = 整棵子树」判定。"""
+        out = [self]
+        for ch in self.children:
+            out.extend(ch.descendants())
+        return out
 
 
 @dataclass(frozen=True)
@@ -303,12 +332,21 @@ class Document:
         """把图元挂回文档 —— :meth:`remove` 的逆操作（undo 侧复原用）。
 
         ``owner`` 给定则挂回该容器 ``children`` 的 ``index`` 位（组结构原样
-        复原，**不会**把叶子变成顶层项）；``owner=None`` 则挂到顶层
-        ``items``。``index`` 越界/为 ``None`` 时追加到末尾。
+        复原，**不会**把叶子变成顶层项）；``owner=None`` 则挂到顶层 ``items``。
+
+        **顶层同样按 ``index`` 插入**（M2 编组修正）：``index=None`` 或越界时
+        追加到末尾。旧实现顶层分支直接 ``append``、忽略 ``index`` ⇒ 编组容器
+        总是落到顶层末尾、解组后子项也全被追加 —— 顶层序无法复原
+        （``test_group_ungroup_preserves_flatten_pointwise_and_order`` 钉住：
+        ``[a,c,b]`` 编组再解组必须回到 ``[a,c,b]`` 而非 ``[c,a,b]``）。
         """
         if owner is None:
-            if not any(cur is item for cur in self.items):
+            if any(cur is item for cur in self.items):
+                return
+            if index is None or not (0 <= index <= len(self.items)):
                 self.items.append(item)
+            else:
+                self.items.insert(index, item)
             return
         if any(ch is item for ch in owner.children):
             return
@@ -351,6 +389,102 @@ class Document:
         """全树最低 z（含容器自身折线单元的 z）。"""
         return min((it.z for it in iter_items(self.items)), default=0.0)
 
+    # -- 编组 / 解组（FR-03，M2） -------------------------------------------
+
+    def owner_of(self, item: Item) -> "Item | None":
+        """图元的**直接** owning container（顶层图元返回 ``None``）。
+
+        「谁持有它」= 它出现在谁（且仅谁）的 ``children`` 里（按身份）。顶层
+        列表不是归属 —— 组内叶子不在 ``items`` 里却属于某容器。
+        """
+        for owner in iter_items(self.items):
+            for ch in owner.children:
+                if ch is item:
+                    return owner
+        return None
+
+    def group_items(self, items, *, name: str = "组") -> Item | None:
+        """把所选图元收进一个新容器（**几何恒等重组**，M2 FR-03①）。
+
+        - **不做「容器 z 归位」**（PRD v1.3 删除该未定义操作）：容器恒为恒等
+          变换（``paths=[]``/``pos=(0,0)``/``scale=1``/``angle_deg=0``），
+          拍平按**全局叶子 z**，故 z 不连续的选择（0、2 夹 1）编组前后
+          ``flatten_visible`` 含折线顺序**逐点恒等**。
+        - 成员可为**任意 mix**：顶层散件 + 已存在的容器（组套组）。成员先按
+          各自所在容器摘除（:meth:`remove` 的组感知），再挂进新容器。
+        - **成环自含拒绝**：待编组集合若与任一成员子树有交集（把祖先选进自己
+          的子集）→ 返回 ``None``（不抛异常，调用侧可静默忽略或提示）。
+        - 成员不足 2 个 → 返回 ``None``（无意义的单元素组）。
+        - 容器插入位置 = **第一个成员的原位置**（owner + 下标）。
+        - **顶层列表序的复原范围**：**相邻**成员编组再解组 ⇒ 顶层序精确复原
+          （undo 的强契约）；**非相邻**成员（如 ``a、b`` 中间夹 ``c``）解组后
+          成员并到组槽位**成连续一段** —— 编组本身就把它们拉到了一起，顶层序
+          不可复原。但**拍平（= 实际切割次序）两种情况都逐点恒等**，因为它按
+          叶子 z 稳定排序、与顶层列表序无关。FR-03① 的验收契约是拍平恒等，
+          故非相邻情形同样成立。
+
+        返回新容器；未编组时返回 ``None``。
+        """
+        chosen: list[Item] = []
+        seen: set[int] = set()
+        for it in items:
+            if id(it) in seen:
+                continue
+            seen.add(id(it))
+            chosen.append(it)
+        if len(chosen) < 2:
+            return None
+        # 自含拒绝：任一成员的**真**子树（不含自身）∩ 待编组集 ≠ ∅ → 成环
+        chosen_ids = {id(it) for it in chosen}
+        for it in chosen:
+            for d in it.descendants():
+                if d is it:
+                    continue  # 自身不算「子树」——每个成员都含自己
+                if id(d) in chosen_ids:
+                    return None
+        # 按当前文档顺序排序（顶层列表序，其次容器内序）→ 成员顺序稳定可预期
+        order = {id(it): i for i, it in enumerate(iter_items(self.items))}
+        chosen.sort(key=lambda it: order.get(id(it), 1 << 30))
+        cont = Item(name=name, z=0.0, children=[])
+        placements: list[DetachInfo] = []
+        for it in chosen:
+            info = self.remove(it)
+            cont.children.append(it)
+            if info is not None:
+                placements.append(info)
+        if not placements:
+            # 成员都不在文档里（纯悬空选择）→ 不产生副作用，回滚
+            cont.children = []
+            return None
+        first = placements[0]
+        self.attach(cont, owner=first.owner, index=first.index)
+        return cont
+
+    def ungroup(self, container: Item) -> list[Item]:
+        """解散容器：其 children **原地**提升到容器原位置（FR-03① 精确恢复）。
+
+        返回被提升的子项列表（原顺序）；容器不是本树的容器 / 本身不持有子项
+        时返回空列表并**不动模型**。容器被摘出后其 ``children`` 清空（它不再是
+        组）。几何**逐位不变**（提升不碰任何成员字段）。
+        """
+        if not container.is_container():
+            return []
+        if not any(cur is container for cur in iter_items(self.items)):
+            return []
+        kids = list(container.children)
+        info = self.remove(container)
+        if info is None:
+            return []
+        idx = info.index
+        for ch in kids:
+            if idx is None:
+                self.attach(ch)
+            else:
+                self.attach(ch, owner=info.owner, index=idx)
+                idx += 1
+        container.children = []
+        return kids
+
 
 def iter_items(items: list[Item], *, _depth: int = 0):
     """深度优先展开**全部** Item（容器本身也产出），不按 visible 过滤。"""
@@ -358,6 +492,66 @@ def iter_items(items: list[Item], *, _depth: int = 0):
     for it in items:
         yield it
         yield from iter_items(it.children, _depth=_depth + 1)
+
+
+def iter_ancestors(items: list[Item], *, _depth: int = 0, _chain: tuple = ()):
+    """产出 ``(item, 祖先链)``，祖先链**根在前、不含 item 自身**。
+
+    补上 M1 缺口的第二条通道：``Item`` 无 ``parent`` 反向指针，而
+    :meth:`Item.page_bbox` 走不到祖先（M2 改用 :meth:`Item.unit_page_bbox`）。
+    与 :func:`iter_flattens` 的 ``chain`` 语义一致，两条通道不得分叉。
+    """
+    _check_depth(_depth)
+    for it in items:
+        yield it, _chain
+        if it.children:
+            yield from iter_ancestors(it.children, _depth=_depth + 1,
+                                       _chain=_chain + (it,))
+
+
+def effectively_visible(doc, item: Item) -> bool:
+    """图元的**有效**可见性 = 自身 + 整条祖先链全 ``visible``（M2 画布侧契约）。
+
+    M1 连带契约的兑现（M1 ``iter_leaves`` docstring「不要在 iter_leaves 里过滤
+    掉隐藏」）：渲染面要建出隐藏图元的场景项（否则隐藏→显示切换永远画不
+    出来），故可见性**不能**在建项时过滤，只能在**显示**时按祖先链求值。
+    画布侧唯一可见性判据（``make_gi`` 与 ``LayoutPage._sync_gi`` 共用）。
+
+    祖先链**必须从文档根查**（``doc.items``）：从 ``[item]`` 查只会遍历
+    item 自己的子树，容器的 ``visible`` 永远不被访问 ⇒ 隐藏容器下的叶子仍
+    被画出。``doc`` 为 ``None``/``item`` 不在文档内时退化为「只看自身」。
+    """
+    if doc is None:
+        return item.visible
+    for cur, chain in iter_ancestors(doc.items):
+        if cur is item:
+            return all(anc.visible for anc in chain) and item.visible
+    return item.visible  # 不在文档里：只看自身
+
+
+def unit_paths(item: Item, chain: tuple["Item", ...] = ()) -> list[Polyline]:
+    """单元的**页面系**折线（已含自身变换 + 祖先链，父∘子由内到外）。
+
+    :func:`iter_units` 的配套消费函数 —— 吸附候选（FR-06）、越界预检、组框
+    overlay 都改走本函数而非裸 ``item.transformed_paths()``/``page_bbox()``：
+    后两者不含祖先链（M1 缺口 #1），编组后对组内叶子会给出局部坐标。
+    """
+    paths = item.transformed_paths()
+    for anc in reversed(chain):  # 由内到外：父∘子
+        paths = [_apply_transform(anc, p) for p in paths]
+    return paths
+
+
+def iter_units(items: list[Item], *, visible_only: bool = True):
+    """产出**渲染/编辑单元** ``(item, 祖先链)``：叶子 + 带自身折线的容器。
+
+    = :func:`iter_flattens` 的单元口径（容器自身折线是一等几何），但只带
+    ``(item, chain)`` —— 供 :meth:`Item.unit_page_bbox` 这类「要页面系几何」
+    的消费侧（越界预检、组框 overlay、对齐/分布）使用，**替代裸
+    ``page_bbox()``**（M1 缺口 #1：裸 page_bbox 不走祖先链 → 编组后漏报）。
+    """
+    for it, _paths, chain in iter_flattens(items, visible_only=visible_only):
+        yield it, chain
 
 
 def iter_flattens(items: list[Item], *, visible_only: bool = True):
@@ -372,10 +566,10 @@ def iter_flattens(items: list[Item], *, visible_only: bool = True):
     - ``visible_only`` 时隐藏项连同整棵子树跳过。
     - 递归深度受 :data:`MAX_TREE_DEPTH` 约束（成环 → ``ValueError``）。
 
-    ⚠ 产出的 ``chain`` 是**唯一**的祖先变换通道：``Item.page_bbox()`` 走不到
-    祖先（见模块 docstring「``page_bbox()`` 不走祖先链」），故本函数的三元组
-    目前**不能**直接喂给 ``layout_page._on_export`` 的越界预检（它要
-    ``Item.page_bbox()``）。属 M2。
+    ⚠ 产出的 ``chain`` 是**唯一**的祖先变换通道：:meth:`Item.page_bbox` 走不到
+    祖先（见模块 docstring「``page_bbox()`` 不走祖先链」），故需要页面系几何的
+    消费侧一律改走 :func:`iter_units` + :meth:`Item.unit_page_bbox` /
+    :func:`unit_paths`（M2 已全部接上）。
 
     叶子文档下与「按 z 排序后逐项 transformed_paths」逐位相同。
     """
@@ -417,12 +611,14 @@ def iter_leaves(items: list[Item], *, visible_only: bool = False):
     但**入模另判**：组内叶子不可再 ``doc.add`` 成第二个顶层 Item，用
     :meth:`Document.contains` 判归属，否则同一几何被切两遍。
 
-    ⚠ **连带契约（M2 必须兑现）**：默认 False 意味着**隐藏容器的叶子也会被
-    建出场景项**。故 ``make_gi`` 的 ``gi.setVisible(item.visible)``（:51）
-    **不足以**表达可见性 —— 容器隐藏、叶子 ``visible=True`` 时会把组内几何
-    画出来。M2 的有效可见性必须是「自身 + 整条祖先链全 visible」；祖先链由
-    :func:`iter_flattens` 携带（或新增携带祖先可见性的遍历），不要在
-    ``iter_leaves`` 里把它过滤掉 —— 那正是 B4 要修的「切换画不出来」。
+  ⚠ **连带契约（M2 已兑现）**：默认 False 意味着**隐藏容器的叶子也会被
+  建出场景项**。故 ``make_gi`` 的 ``gi.setVisible(item.visible)``（:51）
+  **不足以**表达可见性 —— 容器隐藏、叶子 ``visible=True`` 时会把组内几何
+  画出来。**有效可见性 = 自身 + 整条祖先链全 visible**，由
+  :func:`effectively_visible` 统一实现（``make_gi`` 与 ``LayoutPage._sync_gi``
+  共用一份，不各写一套）；祖先链由 :func:`iter_ancestors` 携带，**没有**在
+  :func:`iter_leaves` 里过滤掉隐藏 —— 那正是 B4 要修的「切换画不出来」。
+
 
     反之，隐藏叶子在默认模式下**仍产出**（这正是 B4 的修复点）。
     """

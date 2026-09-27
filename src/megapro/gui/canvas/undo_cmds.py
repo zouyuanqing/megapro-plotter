@@ -18,7 +18,9 @@ from itertools import count
 from PySide6 import QtGui
 
 from megapro.gui.canvas.items import PathItem
-from megapro.gui.layout.model import Item
+from megapro.gui.layout.model import (
+    DetachInfo, Item, effectively_visible, iter_leaves,
+)
 
 __all__ = [
     "make_gi",
@@ -29,6 +31,8 @@ __all__ = [
     "ChangeItemPropsCommand",
     "EditTextCommand",
     "ClearCommand",
+    "GroupCommand",
+    "UngroupCommand",
 ]
 
 #: 手势 token 序号（press→release 一个 token；同时充当 mergeWith 的 id）
@@ -43,15 +47,32 @@ def new_gesture_token() -> int:
     return next(_GESTURE_SEQ)
 
 
-def make_gi(page, item: Item) -> PathItem:
-    """重建式构造场景项并挂进 page（Add/Remove undo 的唯一重建入口）。"""
+def make_gi(page, item: Item) -> PathItem | None:
+    """重建式构造场景项并挂进 page（Add/Remove undo 的唯一重建入口）。
+
+    **容器不建场景项**（M2 兑现 M1 画布侧硬约束，``model.py`` 模块 docstring）：
+    容器 ``paths`` 为空 ⇒ ``PathItem`` 画不出东西，而 ``bbox()`` 递归后非零
+    ⇒ 覆盖整组的隐形可点矩形（画不出、点得到）。渲染单元 = :func:`iter_leaves`。
+
+    **入模判据用** ``doc.contains``（全树身份查找）**而非「是否在顶层列表」**
+    （M1 评审实测的「同一几何切两遍」）：组内叶子不在 ``doc.items`` 里，
+    旧判据 ``item not in page.doc.items`` 会把每个组内叶子**追加成第二个顶层
+    Item** → ``doc.items=['G','a','b']`` 而真实几何单元只有 2 条 ⇒ 切纸机上
+    重复下刀。
+
+    可见性用**祖先链全 visible**（M1 连带契约）：``iter_leaves`` 默认
+    ``visible_only=False``（隐藏→显示可切换），故 ``item.visible`` 单独不足以
+    表达「容器隐藏、叶子 visible」—— 那样会把组内几何画出来。
+    """
+    if item.is_container():
+        return None
     gi = PathItem(item, color="#0a5cff")
     gi._page = page  # 供拖动回写 / 双击重编文字回调
     gi.setZValue(item.z)
-    gi.setVisible(item.visible)
+    gi.setVisible(effectively_visible(page.doc, item))
     page.scene.addItem(gi)
     page._scene_items.append(gi)
-    if item not in page.doc.items:
+    if not page.doc.contains(item):
         page.doc.add(item)
     return gi
 
@@ -65,38 +86,71 @@ class _PageCommand(QtGui.QUndoCommand):
 
 
 class AddItemsCommand(_PageCommand):
-    """添加图元（含文字/图片/绘制/导入）。"""
+    """添加图元（含文字/图片/绘制/导入/**编组容器**）。
+
+    场景项按 :func:`iter_leaves` 建（容器自身不建 PathItem，``make_gi`` 跳过），
+    模型侧只挂**顶层**输入 —— 组内叶子不可重复 ``doc.add``（见 :func:`make_gi`）。
+    """
 
     def __init__(self, page, items: list[Item], text: str = "添加"):
         super().__init__(page, text)
         self.items = list(items)
 
+    def _rebuild_scene(self) -> None:
+        for top in self.items:
+            if not self.page.doc.contains(top):
+                self.page.doc.add(top)
+            for leaf in iter_leaves([top]):
+                if self.page._gi_for(leaf) is None:
+                    make_gi(self.page, leaf)
+
+    def _drop_scene(self) -> None:
+        for top in self.items:
+            for leaf in iter_leaves([top]):
+                gi = self.page._gi_for(leaf)
+                if gi is not None:
+                    self.page.scene.removeItem(gi)
+                    if gi in self.page._scene_items:
+                        self.page._scene_items.remove(gi)
+            self.page.doc.remove(top)
+
     def redo(self) -> None:
-        for it in self.items:
-            make_gi(self.page, it)
+        self._rebuild_scene()
         self.page._after_change()
 
     def undo(self) -> None:
-        for it in self.items:
-            self.page._remove_item_obj(it)
+        self._drop_scene()
         self.page._after_change()
 
 
 class RemoveItemsCommand(_PageCommand):
-    """删除图元。"""
+    """删除图元（顶层或**组内**，组感知，M2）。
+
+    **归属回执必需**（M1 评审裁决）：``doc.remove`` 返回 :class:`DetachInfo`
+    （原容器 + 原下标），undo 据此 ``attach`` 回原容器 —— 否则 ``make_gi``
+    走 ``doc.add`` 把叶子挂成顶层项、**组被静默解散**（无异常、几何还看得见，
+    用户更不易察觉）。``DetachInfo`` 缺失的成员（redo 前就不在文档里）退回
+    ``doc.add``。
+    """
 
     def __init__(self, page, items: list[Item], text: str = "删除"):
         super().__init__(page, text)
         self.items = list(items)
+        self._infos: list[DetachInfo | None] = []
 
     def redo(self) -> None:
+        self._infos = []
         for it in self.items:
-            self.page._remove_item_obj(it)
+            self.page._remove_item_obj(it, info=self._infos)
         self.page._after_change()
 
     def undo(self) -> None:
-        for it in self.items:
-            make_gi(self.page, it)
+        for it, info in zip(self.items, self._infos):
+            if info is not None:
+                self.page.doc.attach(it, owner=info.owner, index=info.index)
+            for leaf in iter_leaves([it]):
+                if self.page._gi_for(leaf) is None:
+                    make_gi(self.page, leaf)
         self.page._after_change()
 
 
@@ -227,14 +281,101 @@ class ClearCommand(_PageCommand):
     def __init__(self, page, text: str = "清空"):
         super().__init__(page, text)
         self.saved: list[Item] = []
+        self._infos: list[DetachInfo | None] = []
 
     def redo(self) -> None:
         self.saved = list(self.page.doc.items)
+        self._infos = []
         for it in list(self.saved):
-            self.page._remove_item_obj(it)
+            self.page._remove_item_obj(it, info=self._infos)
         self.page._after_change()
 
     def undo(self) -> None:
-        for it in self.saved:
-            make_gi(self.page, it)
+        for it, info in zip(self.saved, self._infos):
+            if info is not None:
+                self.page.doc.attach(it, owner=info.owner, index=info.index)
+            for leaf in iter_leaves([it]):
+                if self.page._gi_for(leaf) is None:
+                    make_gi(self.page, leaf)
+        self.page._after_change()
+
+
+class GroupCommand(_PageCommand):
+    """编组（FR-03/T3 + FR-04/T4）：几何恒等重组，重建式。
+
+    **场景项集合不变**（编组不增删几何）：容器不建 PathItem、成员 PathItem
+    原样留存 ⇒ 只需重排 z 值 + 重建选中。undo 走 :meth:`Document.ungroup`
+    精确恢复原顶层序。
+    """
+
+    def __init__(self, page, items: list[Item], *, name: str = "组",
+                 text: str = "编组"):
+        super().__init__(page, text)
+        self.items = list(items)
+        self.name = name
+        self.container: Item | None = None
+
+    def _after_group(self) -> None:
+        # 场景项已在（编组不改几何集合）；只需让 z 与选中跟上模型
+        for leaf in iter_leaves([self.container]) if self.container else ():
+            self.page._sync_gi(leaf)
+
+    def redo(self) -> None:
+        self.container = self.page.doc.group_items(self.items, name=self.name)
+        if self.container is None:
+            return
+        self._after_group()
+        self.page._after_change()
+
+    def undo(self) -> None:
+        if self.container is None:
+            return
+        self.page.doc.ungroup(self.container)
+        self._after_group()
+        self.page._after_change()
+
+
+class UngroupCommand(_PageCommand):
+    """解组（FR-03/T3 + FR-04/T4）：容器摘除、子项原地提升，几何逐位不变。
+
+    redo 时记下容器的**原归属**（owner 容器 + 下标），undo 据此原位挂回 ——
+    解组后再编组才回到同一层序（否则组会被追加到顶层末尾）。
+    """
+
+    def __init__(self, page, container: Item, text: str = "解组"):
+        super().__init__(page, text)
+        self.container = container
+        self._owner: Item | None = None
+        self._index: int | None = None
+
+    def _after_ungroup(self, kids: list[Item]) -> None:
+        for leaf in iter_leaves(kids):
+            self.page._sync_gi(leaf)
+
+    def redo(self) -> None:
+        if self._owner is None and self._index is None:
+            self._owner = self.page.doc.owner_of(self.container)
+        self._index = self._slot()
+        kids = self.page.doc.ungroup(self.container)
+        self._after_ungroup(kids)
+        self.page._after_change()
+
+    def _slot(self) -> int | None:
+        """容器当前所在下标（顶层列表或 owner.children）。"""
+        if self._owner is not None:
+            for i, ch in enumerate(self._owner.children):
+                if ch is self.container:
+                    return i
+            return None
+        for i, it in enumerate(self.page.doc.items):
+            if it is self.container:
+                return i
+        return None
+
+    def undo(self) -> None:
+        if not self.container.children:
+            # 已被别处清空（不应发生）—— 防御：不产生错误结构
+            return
+        self.page.doc.attach(self.container, owner=self._owner, index=self._index)
+        self._after_ungroup(list(self.container.children))
         self.page._after_change()

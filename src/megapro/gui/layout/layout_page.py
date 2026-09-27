@@ -37,23 +37,29 @@ from megapro.gui.canvas.coords import (
     paper_from_svg_ydown,
     place_at_anchor,
 )
+from megapro.gui.canvas.group_overlay import GroupOverlay
 from megapro.gui.canvas.handles import SelectionHandles
 from megapro.gui.canvas.items import PathItem
 from megapro.gui.canvas.paper_scene import PaperScene
 from megapro.gui.canvas.paper_view import PaperView
 from megapro.gui.canvas.rulers import RulerWidget
-from megapro.gui.canvas.snap import SnapEngine
+from megapro.gui.canvas.snap import SnapEngine, snap_candidate_paths
 from megapro.gui.canvas.undo_cmds import (
     AddItemsCommand,
     ChangeItemPropsCommand,
     ClearCommand,
     EditTextCommand,
+    GroupCommand,
     MoveItemsCommand,
     RemoveItemsCommand,
+    UngroupCommand,
     new_gesture_token,
 )
 from megapro.gui.layout.export_svg import document_to_svg
-from megapro.gui.layout.model import Document, Item, normalize_local
+from megapro.gui.layout.model import (
+    DetachInfo, Document, Item, effectively_visible, iter_leaves, iter_units,
+    normalize_local,
+)
 
 from megapro.gui.text_to_svg import (
     find_cjk_font, list_fonts, text_outline_svg, text_singleline_svg,
@@ -157,6 +163,55 @@ def _union_bbox(boxes) -> tuple[float, float, float, float]:
     )
 
 
+# --- 剪贴板序列化（FR-06 递归化） ------------------------------------------
+#
+# 契约：容器**连子树**一起序列化/克隆（``children`` 键），叶子格式与既有平面
+# JSON **逐字段兼容**（``paths``/``pos``/``scale``/``angle_deg``/``name``/``z``/
+# ``text_spec``）—— 旧剪贴板内容仍可粘贴。``visible``/``locked`` 一并带走。
+# 组内相对布局在粘贴后保持（各子项 pos 相对不变，只对**容器根**加偏移），
+# 故偏移只施加在根，不逐层累加（逐层会双重偏移）。
+
+
+def _item_to_json(item: Item) -> dict:
+    d = {"paths": item.paths, "pos": item.pos, "scale": item.scale,
+         "angle_deg": item.angle_deg, "name": item.name, "z": item.z,
+         "text_spec": item.text_spec, "visible": item.visible,
+         "locked": item.locked}
+    if item.children:
+        d["children"] = [_item_to_json(ch) for ch in item.children]
+    return d
+
+
+def _item_from_json(d: dict, *, dz: float, z: float) -> Item:
+    """剪贴板 JSON → Item（递归）。``dz`` 偏移与 ``z`` **只施加在根上**。
+
+    根的 z 强制取 ``z``（副本/粘贴须落在新最上层 —— 与既有平面 JSON 的
+    ``z=top_z+1`` 行为逐位一致）；子项各自保留**序列化的原 z**（组内相对
+    层序保持）。偏移只加根不逐层累加（逐层会双重偏移）。
+    """
+    pos = d.get("pos", (0.0, 0.0))
+    kids = [_item_from_json(c, dz=0.0, z=float(c.get("z", 0.0)))
+            for c in d.get("children", [])]
+    return Item(
+        paths=[[(float(x), float(y)) for x, y in p]
+               for p in d.get("paths", [])],
+        pos=(float(pos[0]) + dz, float(pos[1]) + dz),
+        scale=float(d.get("scale", 1.0)),
+        angle_deg=float(d.get("angle_deg", 0.0)),
+        name=d.get("name", "item"),
+        z=float(z),
+        visible=bool(d.get("visible", True)),
+        locked=bool(d.get("locked", False)),
+        text_spec=copy.deepcopy(d.get("text_spec")),
+        children=kids,
+    )
+
+
+def _clone_item(item: Item, *, dz: float, z: float) -> Item:
+    """:func:`_item_from_json` 的对象版（副本深拷贝，偏移只加在根）。"""
+    return _item_from_json(_item_to_json(item), dz=dz, z=z)
+
+
 class LayoutPage(QtWidgets.QWidget):
     """排版页：信号 export_requested(JobSpec) 供 MainWindow 送去作业。
 
@@ -197,13 +252,24 @@ class LayoutPage(QtWidgets.QWidget):
                 return gi
         return None
 
-    def _remove_item_obj(self, item: Item) -> None:
+    def _remove_item_obj(self, item: Item,
+                         info: list | None = None) -> "DetachInfo | None":
+        """摘除一个图元（顶层或组内叶子）及其场景项。
+
+        **时序 = 先模型后场景**（M1 评审裁决）：``doc.remove`` 是组感知的、不会
+        抛异常（抛异常会让 ``QUndoStack`` 半污染 —— 命令已入栈而模型未改，
+        Ctrl+Z 后几何翻倍），故可安全先摘模型。``info`` 传入 list 时把归属回执
+        追加进去（undo 复原组结构用，见 :class:`RemoveItemsCommand`）。
+        """
+        det = self.doc.remove(item)
         gi = self._gi_for(item)
         if gi is not None:
             self.scene.removeItem(gi)
             if gi in self._scene_items:
                 self._scene_items.remove(gi)
-        self.doc.remove(item)
+        if info is not None:
+            info.append(det)
+        return det
 
     def _sync_gi(self, item: Item) -> None:
         """model → 场景（场景 ≡ 纸面 y-up，**无翻转**）—— 场景同步唯一入口。"""
@@ -212,15 +278,207 @@ class LayoutPage(QtWidgets.QWidget):
             return
         gi.apply_model_state()
         gi.setZValue(item.z)
-        gi.setVisible(item.visible)
+        gi.setVisible(effectively_visible(self.doc, item))
         gi.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, not item.locked)
         gi.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, not item.locked)
         gi.update()
 
     def _after_change(self) -> None:
-        """任何编辑后：刷新属性/手柄。"""
+        """任何编辑后：刷新属性/手柄/组框。"""
         self._refresh_props()
         self._handles.sync(self._selected())
+        self._group_overlay.refresh(self._page_box)
+
+    def _page_box(self, item: Item) -> tuple[float, float, float, float]:
+        """model.Item → **页面系** bbox（含祖先链，M1 缺口 #1 的正解）。
+
+        越界预检 / 组框 overlay / 对齐 / 分布 / 多选数值一律走本函数，不吃裸
+        ``item.page_bbox()``（后者不走祖先链 → 组内叶子在非恒等容器下报局部坐标）。
+        """
+        for it, chain in iter_units([item], visible_only=False):
+            if it is item:
+                return item.unit_page_bbox(chain)
+        return item.page_bbox()
+
+    # -- 组：选择语义（FR-03 / FR-05） --------------------------------------
+
+    def _owner_container(self, item: Item) -> Item | None:
+        """图元所属的**最外层**容器（顶层图元返回 None）。
+
+        祖先链必须**从文档根**查（``iter_ancestors(doc.items)``）—— 从
+        ``[item]`` 查只会遍历 item 自己的子树、拿不到容器的上下文。
+        """
+        from megapro.gui.layout.model import iter_ancestors
+
+        for it, anc in iter_ancestors(self.doc.items):
+            if it is item:
+                return anc[-1] if anc else None
+        return None
+
+    def _group_siblings(self, item: Item) -> list[Item]:
+        """与 ``item`` 同属一个容器的兄弟（普通态点选时一并选中的集合）。
+
+        顶层图元 = 自身（无组）。组编辑态下调用方须自行限定为叶子操作单元。
+        """
+        owner = self._owner_container(item)
+        if owner is None:
+            return [item]
+        return list(owner.children)
+
+    def _expand_group_selection(self) -> None:
+        """普通态：选中集合里任一组成员 ⇒ 选中**整组**（FR-03 选择语义）。
+
+        「点组内子项先选中整组」：对每个选中的图元取同容器的兄弟并全选。
+        **组编辑态不做**（双击进组后操作单元 = 叶子，FR-05 选择态二分）。
+        """
+        if self._group_overlay.editing is not None:
+            return
+        sel = self._selected()
+        if not sel:
+            return
+        wanted: list[Item] = []
+        for gi in sel:
+            it = gi.model_item
+            wanted.extend(self._group_siblings(it))
+        if not wanted:
+            return
+        ids = {id(it) for it in wanted}
+        for gi in self._scene_items:
+            want = id(gi.model_item) in ids
+            if gi.isSelected() != want:
+                gi.setSelected(want)
+
+    def _enter_group_edit(self, item: Item) -> None:
+        """双击组内子项 ⇒ 进组编辑态（FR-03「双击进组选子项」）。"""
+        owner = self._owner_container(item)
+        self._group_overlay.set_editing(owner)
+        self._group_overlay.refresh(self._page_box)
+
+    def on_item_double_clicked(self, item: Item) -> bool:
+        """双击回调（FR-03「双击进组选子项」）：组内子项 ⇒ 进组编辑态。
+
+        返回 True 表示已消费（不再走文字重编）。顶层图元/组编辑态内的子项
+        返回 False，由 :class:`PathItem` 继续走文字重编等既有回调。
+        """
+        if self._group_overlay.editing is not None:
+            return False
+        owner = self._owner_container(item)
+        if owner is None:
+            return False
+        self._enter_group_edit(item)
+        return True
+
+    def _exit_group_edit(self) -> None:
+        self._group_overlay.set_editing(None)
+        self._group_overlay.refresh(self._page_box)
+
+    def _group_selected_items(self) -> list[Item]:
+        """当前选择对应的**组选中 = 叶子集**（FR-05 v1.2 裁决）。
+
+        容器不建 PathItem、也不在选择集里，故选择集天然就是叶子集；组级
+        移动/缩放/旋转由此走既有多选机制（``handles.py`` 多选等比公式、
+        :meth:`_apply_pos` 多选整体平移），**不新增容器变换渲染通路**。
+        """
+        return [gi.model_item for gi in self._selected()]
+
+    def _selected_units(self) -> list[tuple[Item, Item | None]]:
+        """**操作单元**（FR-05 v1.3 选择态二分），**按身份去重**。
+
+        普通态：整组按**容器**（其 bbox 走 :meth:`_page_box`），组外散件按
+        自身 —— 普通态混选只能是「整组 + 组外散件」。
+        组编辑态：操作单元 = 叶子 ``(叶子, None)``。
+
+        **去重是必需的，不是优化**（M2 评审阻塞项）：组选中 = 叶子集，故
+        N 个成员的组会经 :meth:`_selected` 产出 **N 条**同容器的单元。若不去重：
+        - ``_distribute`` 的除数 ``len(boxes) - 1`` 被重复项灌大 ⇒ gaps 偏小、
+          每个重复项又按不同 target 各写一次绝对 pos（``ChangeItemPropsCommand``
+          是 setattr 绝对赋值、最后一条生效）⇒ **整组被平移一个非零量**。
+          实跑：A(y=0)/B(y=100) + 组 G{C(y=50),D(y=60)} 三单元全选，
+          ``units=['B','G','G','A']`` ⇒ C 50→66.67、D 60→76.67，而正确分布
+          应是**零位移**（lo=0、hi=100、gaps=50，target 0/50/100 与现 y0 吻合）。
+        - 每个成员也会被写多次 pos（多余命令项）。
+        对齐/分布的 min/max/union 不受重复项影响（min/max 幂等），故该缺陷
+        **只**在 ``_distribute`` 显形 —— 但根因在此处统一修，各消费方同口径。
+
+        返回 ``(item, None)`` 里的 None 占位是「叶子附带其容器引用」的扩展位；
+        当前实现两者都为 None 以保持调用侧简洁。
+        """
+        editing = self._group_overlay.editing
+        out: list[tuple[Item, Item | None]] = []
+        seen: set[int] = set()
+        for gi in self._selected():
+            it = gi.model_item
+            unit = it if editing is not None else (
+                self._owner_container(it) or it)
+            if id(unit) in seen:  # 同一容器只算一个操作单元
+                continue
+            seen.add(id(unit))
+            out.append((unit, None))
+        return out
+
+    def _unit_bbox(self, unit: Item) -> tuple[float, float, float, float]:
+        """操作单元的 bbox：组 = 容器页面系 bbox，散件/叶子 = 自身页面系 bbox。"""
+        return self._page_box(unit)
+
+    def group_selected(self) -> None:
+        """编组（FR-03）。成员 = 当前选择的**组单元**去重后的图元。"""
+        members = self._group_members_for_grouping()
+        if len(members) < 2:
+            self.status_message.emit("编组需选中至少两个图元")
+            return
+        cmd = GroupCommand(self, members, name=f"组{len(members)}")
+        self._undo.push(cmd)
+        if cmd.container is None:
+            self.status_message.emit("无法编组：选择里包含组的祖先")
+            return
+        cont = cmd.container
+        for it in members:
+            gi = self._gi_for(it)
+            if gi is not None:
+                gi.setSelected(False)
+        self._after_group_promote(cont)
+
+    def _group_members_for_grouping(self) -> list[Item]:
+        """编组成员 = 选择集里的图元本身（含整组时用整组的**全部叶子**）。
+
+        组选中 = 叶子集（FR-05）：选中整组后编组，成员就是那些叶子（把组
+        套进组才用容器本身）—— 故取选择集的并集（去重、按身份）。
+        """
+        return list(dict.fromkeys(self._group_selected_items()))
+
+    def _after_group_promote(self, container: Item) -> None:
+        """编组后：整组重新选中（组选中 = 叶子集）+ 刷新组框。"""
+        for leaf in iter_leaves([container]):
+            gi = self._gi_for(leaf)
+            if gi is not None:
+                gi.setSelected(True)
+        self._after_change()
+
+    def ungroup_selected(self) -> None:
+        """解组（FR-03）：对当前选区里的**每个容器**执行一次解组。"""
+        conts = []
+        for it in self._group_selected_items():
+            owner = self._owner_container(it)
+            if owner is not None and owner not in conts:
+                conts.append(owner)
+        if not conts:
+            self.status_message.emit("请选中组内图元后解组")
+            return
+        # 一个容器一条命令；逆序执行使下标回退互不干扰
+        for cont in reversed(conts):
+            self._undo.push(UngroupCommand(self, cont))
+        for it in self._group_selected_items():
+            gi = self._gi_for(it)
+            if gi is not None:
+                gi.setSelected(True)
+        self._after_change()
+
+    # 注：**拖组 = 一条可撤销命令**不需要本文件新增代码 —— 组选中 = 叶子集时，
+    # Qt 同步移动全部选中项，``PathItem.commit_move``（``canvas/items.py``）按
+    # 「gi 与 model 已漂移」把整组叶子收进**同一条** ``MoveItemsCommand``。
+    # 组级缩放/旋转同理：``SelectionHandles`` 的多选等比公式（``scale_i' =
+    # k·scale_i``、``pos_i' = A + k(pos_i − A)``）已按选择集工作，选择集就是
+    # 组叶子集 ⇒ 一条 ``ChangeItemPropsCommand``。二者都是**零新增渲染通路**。
 
     def _refresh_undo_actions(self) -> None:
         if hasattr(self, "_undo_act"):
@@ -236,6 +494,7 @@ class LayoutPage(QtWidgets.QWidget):
         self.view = PaperView(self.scene, self)
         self.view.set_tool(TOOL_SELECT)
         self._handles = SelectionHandles(self.scene, self.view, self)
+        self._group_overlay = GroupOverlay(self.scene, self.view, self)
         self.view.viewChanged.connect(self._sync_snap_pitch)
         self.view.fit()
         self._sync_snap_pitch()
@@ -301,6 +560,11 @@ class LayoutPage(QtWidgets.QWidget):
             b.setDefaultAction(a)
             b.setAutoRaise(True)
             tb.addWidget(b)
+        tb.addSeparator()
+        # 编组/解组（FR-03）
+        for label, fn in (("编组", self.group_selected),
+                          ("解组", self.ungroup_selected)):
+            add_btn(label, fn)
         tb.addSeparator()
         # 层序/对齐/删除
         for label, fn in (("置顶", lambda: self._zorder("top")),
@@ -382,7 +646,16 @@ class LayoutPage(QtWidgets.QWidget):
         return QtCore.QPointF(x, y)
 
     def _all_paths(self) -> list:
-        return [p for it in self.doc.items for p in it.paths]
+        """绘制工具的对象吸附候选 = **页面系**可见几何（FR-06 前置修复）。
+
+        旧实现返回 ``it.paths``（**局部**坐标）而 :meth:`_snap_pt` 喂入的是页面
+        坐标 → 域不一致，``pos≠(0,0)`` 的图元在页面点附近恒零对象命中（既有
+        ``test_grid_snap_draw_tool_and_item`` 是空文档、只验网格，掩盖了该 bug）。
+        候选源现与拖动侧 ``PathItem._snap_value`` 共用
+        :func:`~megapro.gui.canvas.snap.snap_candidate_paths`（一份实现），
+        且随编组自动含组内叶子、排除隐藏图元。
+        """
+        return snap_candidate_paths(self.doc)
 
     # -- 选中/属性 ---------------------------------------------------------
 
@@ -392,8 +665,10 @@ class LayoutPage(QtWidgets.QWidget):
 
     def _on_selection_changed(self) -> None:
         self._end_prop_gesture()  # 换目标即新手势（禁止跨选中合并）
+        self._expand_group_selection()  # 普通态：选一个组成员 = 选整组
         self._refresh_props()
         self._handles.sync(self._selected())
+        self._group_overlay.refresh(self._page_box)
 
     def _refresh_props(self) -> None:
         sel = self._selected()
@@ -413,10 +688,12 @@ class LayoutPage(QtWidgets.QWidget):
         if len(sel) == 1:
             self.sp_x.setValue(it.pos[0])
             self.sp_y.setValue(it.pos[1])
-            x0, y0, x1, y1 = it.page_bbox()
+            x0, y0, x1, y1 = self._page_box(it)
         else:
-            # 多选：X/Y 显示选择集 bbox 锚点（与 _apply_pos 的整体平移一致）
-            x0, y0, x1, y1 = _union_bbox([gi.model_item.page_bbox() for gi in sel])
+            # 多选：X/Y 显示操作单元集合的 bbox 锚点（与 _apply_pos 的整体平移
+            # 一致）；组按**容器** page_bbox 参与（FR-05 普通态单元二分）
+            x0, y0, x1, y1 = _union_bbox([self._unit_bbox(u)
+                                         for u, _ in self._selected_units()])
             ax, ay = anchor_point((x0, y0, x1, y1), self._pos_anchor)
             self.sp_x.setValue(ax)
             self.sp_y.setValue(ay)
@@ -462,31 +739,53 @@ class LayoutPage(QtWidgets.QWidget):
                                                token=self._prop_token))
 
     def _apply_pos(self, tx: float, ty: float) -> None:
-        """单选=锚点绝对定位；多选=按选择集 bbox 锚点整体平移（不塌缩）。"""
+        """单选=锚点绝对定位；多选=按**操作单元** bbox 锚点整体平移（不塌缩）。
+
+        FR-05 单元二分：普通态组按容器 bbox 参与，但**结果作用在叶子集**
+        （一条命令、组内布局保持 —— 容器恒等、无变换通路）；组编辑态单元=叶子。
+        """
         sel = self._selected()
+        if not sel:
+            return
+        units = self._selected_units()
         changes = []
         if len(sel) == 1:
             it = sel[0].model_item
             changes.append((it, {"pos": it.pos},
                            {"pos": _pos_for_anchor(it, (tx, ty), self._pos_anchor)}))
         else:
-            boxes = [gi.model_item.page_bbox() for gi in sel]
-            ax, ay = anchor_point(_union_bbox(boxes), self._pos_anchor)
+            ax, ay = anchor_point(_union_bbox([self._unit_bbox(u) for u, _ in units]),
+                                  self._pos_anchor)
             dx, dy = tx - ax, ty - ay
-            for gi in sel:
-                it = gi.model_item
-                changes.append((it, {"pos": it.pos},
-                               {"pos": (it.pos[0] + dx, it.pos[1] + dy)}))
+            for unit, _ in units:
+                for leaf in self._leaves_of_unit(unit):
+                    it = leaf
+                    changes.append((it, {"pos": it.pos},
+                                   {"pos": (it.pos[0] + dx, it.pos[1] + dy)}))
         self._push_props(changes, "数值定位")
 
+    def _leaves_of_unit(self, unit: Item) -> list[Item]:
+        """操作单元 → 实际要写 pos/scale 的**叶子集合**（组 = 整棵子树的叶子）。
+
+        组级变换只写叶子集合（FR-04/FR-05 裁决）：容器恒为恒等、场景里没有
+        容器 gi，组级移动/缩放/旋转由此走既有多选机制。
+        """
+        if unit.is_container():
+            return list(iter_leaves([unit]))
+        return [unit]
+
     def _apply_size(self, value: float, *, axis: str) -> None:
-        """宽/高等比联动（sp_h 生效：scale × target/cur）。"""
+        """宽/高等比联动（sp_h 生效：scale × target/cur）。
+
+        FR-05：多选按**操作单元** bbox 定 k，组内叶子按同一 k 等比缩放并围绕
+        锚点整体平移（一条命令、组内布局保持）。
+        """
         sel = self._selected()
         if value <= 0:
             return
         if len(sel) == 1:
             it = sel[0].model_item
-            x0, y0, x1, y1 = it.page_bbox()
+            x0, y0, x1, y1 = self._page_box(it)
             cur = abs(x1 - x0) if axis == "w" else abs(y1 - y0)
             if cur <= 1e-9:
                 return
@@ -494,21 +793,21 @@ class LayoutPage(QtWidgets.QWidget):
             self._push_props(
                 [(it, {"scale": it.scale}, {"scale": it.scale * k})], "等比缩放")
             return
-        boxes = [gi.model_item.page_bbox() for gi in sel]
-        u = _union_bbox(boxes)
+        units = self._selected_units()
+        u = _union_bbox([self._unit_bbox(x) for x, _ in units])
         cur = abs(u[2] - u[0]) if axis == "w" else abs(u[3] - u[1])
         if cur <= 1e-9:
             return
         k = value / cur
         ax, ay = anchor_point(u, self._pos_anchor)
         changes = []
-        for gi in sel:
-            it = gi.model_item
-            changes.append((it,
-                            {"pos": it.pos, "scale": it.scale},
-                            {"pos": (ax + k * (it.pos[0] - ax),
-                                     ay + k * (it.pos[1] - ay)),
-                             "scale": it.scale * k}))
+        for unit, _ in units:
+            for it in self._leaves_of_unit(unit):
+                changes.append((it,
+                                {"pos": it.pos, "scale": it.scale},
+                                {"pos": (ax + k * (it.pos[0] - ax),
+                                         ay + k * (it.pos[1] - ay)),
+                                 "scale": it.scale * k}))
         self._push_props(changes, "整体等比缩放")
 
     def _apply_angle(self, deg: float) -> None:
@@ -528,16 +827,17 @@ class LayoutPage(QtWidgets.QWidget):
                 [(it, {"scale": it.scale}, {"scale": value})], "缩放")
             return
         k = value / (sel[0].model_item.scale or 1e-9)
-        boxes = [gi.model_item.page_bbox() for gi in sel]
-        ax, ay = anchor_point(_union_bbox(boxes), self._pos_anchor)
+        units = self._selected_units()
+        ax, ay = anchor_point(_union_bbox([self._unit_bbox(x) for x, _ in units]),
+                              self._pos_anchor)
         changes = []
-        for gi in sel:
-            it = gi.model_item
-            changes.append((it,
-                            {"pos": it.pos, "scale": it.scale},
-                            {"pos": (ax + k * (it.pos[0] - ax),
-                                     ay + k * (it.pos[1] - ay)),
-                             "scale": it.scale * k}))
+        for unit, _ in units:
+            for it in self._leaves_of_unit(unit):
+                changes.append((it,
+                                {"pos": it.pos, "scale": it.scale},
+                                {"pos": (ax + k * (it.pos[0] - ax),
+                                         ay + k * (it.pos[1] - ay)),
+                                 "scale": it.scale * k}))
         self._push_props(changes, "整体等比缩放")
 
     def _sync_models(self) -> None:
@@ -572,6 +872,9 @@ class LayoutPage(QtWidgets.QWidget):
                      QtCore.Qt.Key_Up, QtCore.Qt.Key_Down):
                 self._nudge(k, bool(mods & QtCore.Qt.ShiftModifier))
                 return
+            if k == QtCore.Qt.Key_Escape and self._group_overlay.editing is not None:
+                self._exit_group_edit()  # 退出组编辑态
+                return
         super().keyPressEvent(event)
 
     def _nudge(self, key, big: bool) -> None:
@@ -592,12 +895,15 @@ class LayoutPage(QtWidgets.QWidget):
             self._undo.push(RemoveItemsCommand(self, items))
 
     def _copy_selected(self) -> None:
+        """复制（FR-06 递归化）：按**操作单元**序列化，容器连子树一起带走。"""
+        units = self._selected_units()
+        seen: set[int] = set()
         data = []
-        for gi in self._selected():
-            it = gi.model_item
-            data.append({"paths": it.paths, "pos": it.pos, "scale": it.scale,
-                         "angle_deg": it.angle_deg, "name": it.name, "z": it.z,
-                         "text_spec": it.text_spec})
+        for unit, _ in units:
+            if id(unit) in seen:
+                continue
+            seen.add(id(unit))
+            data.append(_item_to_json(unit))
         QtWidgets.QApplication.clipboard().setText(json.dumps(data))
 
     def _paste(self) -> None:
@@ -606,101 +912,122 @@ class LayoutPage(QtWidgets.QWidget):
         except Exception:
             return
         items = []
+        top_z = self.doc.top_z()
         for d in data:
-            it = Item(paths=[list(map(tuple, p)) for p in d["paths"]],
-                      pos=(d["pos"][0] + 5, d["pos"][1] + 5),
-                      scale=d.get("scale", 1.0), angle_deg=d.get("angle_deg", 0.0),
-                      name=d.get("name", "item"), z=self.doc.top_z() + 1,
-                      text_spec=d.get("text_spec"))
+            it = _item_from_json(d, dz=5.0, z=top_z + 1)
             items.append(it)
+            top_z = max(top_z, it.z)
         if items:
             self._undo.push(AddItemsCommand(self, items, "粘贴"))
 
     def _duplicate(self) -> None:
+        """复制副本：同 :meth:`_copy_selected` 的单元口径 + 深拷贝子树。"""
+        units = self._selected_units()
+        seen: set[int] = set()
         items = []
-        for gi in self._selected():
-            it = gi.model_item
-            items.append(Item(paths=copy.deepcopy(it.paths),
-                              pos=(it.pos[0] + 5, it.pos[1] + 5),
-                              scale=it.scale, angle_deg=it.angle_deg,
-                              name=it.name, z=self.doc.top_z() + 1,
-                              text_spec=copy.deepcopy(it.text_spec)))
+        top_z = self.doc.top_z()
+        for unit, _ in units:
+            if id(unit) in seen:
+                continue
+            seen.add(id(unit))
+            items.append(_clone_item(unit, dz=5.0, z=top_z + 1))
+            top_z = max(top_z, items[-1].z)
         if items:
             self._undo.push(AddItemsCommand(self, items, "复制副本"))
 
     # -- 层序 / 对齐 / 分布 -------------------------------------------------
 
     def _zorder(self, mode: str) -> None:
+        """层序（FR-06 组语义）：组按**整组**参与，组内叶子 z 同步更新且
+        **保持组内相对次序**，全部一条命令。
+
+        「up/down」按组内**最小** z 判档、整体平移同一增量（保持组内间距）；
+        「top/bottom」把整组压到全树最上/最下（组内相对次序仍保留）。
+        """
         sel = self._selected()
         if not sel:
             return
         changes = []
-        for gi in sel:
-            it = gi.model_item
-            old = {"z": it.z}
+        for unit, _ in self._selected_units():
+            leaves = self._leaves_of_unit(unit)
+            if not leaves:
+                continue
+            zs = [it.z for it in leaves]
             if mode == "top":
-                new_z = self.doc.top_z() + 1
+                new_zs = [self.doc.top_z() + 1 + i for i in range(len(leaves))]
             elif mode == "bottom":
-                new_z = self.doc.bottom_z() - 1
-            elif mode == "up":
-                new_z = it.z + 1
+                base = self.doc.bottom_z() - 1
+                new_zs = [base + i for i in range(len(leaves))]
             else:
-                new_z = it.z - 1
-            changes.append((it, old, {"z": new_z}))
-        self._undo.push(ChangeItemPropsCommand(self, changes, "层序"))
+                cur = min(zs) if mode == "up" else max(zs)
+                delta = 1.0 if mode == "up" else -1.0
+                new_zs = [z + delta for z in zs]
+            for it, nz in zip(leaves, new_zs):
+                if it.z != nz:
+                    changes.append((it, {"z": it.z}, {"z": nz}))
+        if changes:
+            self._undo.push(ChangeItemPropsCommand(self, changes, "层序"))
 
     def _align(self, mode: str) -> None:
-        sel = self._selected()
-        if len(sel) < 2:
+        """对齐（FR-06 组语义）：组按**容器 bbox** 参与，组内布局保持。
+
+        每个操作单元算一次位移，再作用到该单元的**整个叶子集**（一条命令）。
+        """
+        units = self._selected_units()
+        if len(units) < 2:
             return
-        boxes = [(gi.model_item, gi.model_item.page_bbox()) for gi in sel]
+        boxes = [(u, self._unit_bbox(u)) for u, _ in units]
         xs0 = [b[0] for _, b in boxes]
         xs1 = [b[2] for _, b in boxes]
         ys0 = [b[1] for _, b in boxes]
         ys1 = [b[3] for _, b in boxes]
         changes = []
-        for it, (x0, y0, x1, y1) in boxes:
-            old = {"pos": it.pos}
-            px, py = it.pos
+        for unit, (x0, y0, x1, y1) in boxes:
+            dx = dy = 0.0
             if mode == "left":
-                px += min(xs0) - x0
+                dx = min(xs0) - x0
             elif mode == "right":
-                px += max(xs1) - x1
+                dx = max(xs1) - x1
             elif mode == "hcenter":
-                px += (min(xs0) + max(xs1)) / 2 - (x0 + x1) / 2
+                dx = (min(xs0) + max(xs1)) / 2 - (x0 + x1) / 2
             elif mode == "top":
-                py += max(ys1) - y1
+                dy = max(ys1) - y1
             elif mode == "bottom":
-                py += min(ys0) - y0
-            changes.append((it, old, {"pos": (px, py)}))
-        self._undo.push(ChangeItemPropsCommand(self, changes, "对齐"))
+                dy = min(ys0) - y0
+            for it in self._leaves_of_unit(unit):
+                changes.append((it, {"pos": it.pos},
+                               {"pos": (it.pos[0] + dx, it.pos[1] + dy)}))
+        if changes:
+            self._undo.push(ChangeItemPropsCommand(self, changes, "对齐"))
 
     def _distribute(self, axis: str) -> None:
-        sel = self._selected()
-        if len(sel) < 3:
+        """分布（FR-06 组语义）：组按容器 bbox 作为一个分布单元参与。"""
+        units = self._selected_units()
+        if len(units) < 3:
             return
-        boxes = [(gi.model_item, gi.model_item.page_bbox()) for gi in sel]
+        boxes = [(u, self._unit_bbox(u)) for u, _ in units]
+        changes = []
         if axis == "v":
             boxes.sort(key=lambda t: t[1][1])
             lo = boxes[0][1][1]
             hi = boxes[-1][1][3]
             gaps = (hi - lo) / (len(boxes) - 1)
-            changes = []
-            for i, (it, (x0, y0, x1, y1)) in enumerate(boxes):
-                old = {"pos": it.pos}
+            for i, (unit, (x0, y0, x1, y1)) in enumerate(boxes):
                 target = lo + i * gaps
-                changes.append((it, old, {"pos": (it.pos[0], it.pos[1] + target - y0)}))
-            self._undo.push(ChangeItemPropsCommand(self, changes, "分布"))
+                for it in self._leaves_of_unit(unit):
+                    changes.append((it, {"pos": it.pos},
+                                   {"pos": (it.pos[0], it.pos[1] + target - y0)}))
         else:
             boxes.sort(key=lambda t: t[1][0])
             lo = boxes[0][1][0]
             hi = boxes[-1][1][2]
             gaps = (hi - lo) / (len(boxes) - 1)
-            changes = []
-            for i, (it, (x0, y0, x1, y1)) in enumerate(boxes):
-                old = {"pos": it.pos}
+            for i, (unit, (x0, y0, x1, y1)) in enumerate(boxes):
                 target = lo + i * gaps
-                changes.append((it, old, {"pos": (it.pos[0] + target - x0, it.pos[1])}))
+                for it in self._leaves_of_unit(unit):
+                    changes.append((it, {"pos": it.pos},
+                                   {"pos": (it.pos[0] + target - x0, it.pos[1])}))
+        if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "分布"))
 
     # -- 添加 --------------------------------------------------------------
@@ -809,16 +1136,35 @@ class LayoutPage(QtWidgets.QWidget):
         self._add_items([it], "导入SVG")
 
     def _add_doc(self) -> None:
-        from megapro.gui.layout.doc_import import DocImportDialog
+        """导入 Word/Excel（M2 · T7b：调用侧翻转 —— 整组包进恒等容器）。
+
+        ``doc_import.extract_*`` 的**平铺返回契约不变**（M1 冻结用例依赖顶层
+        名字查找与 ``len(items)>=3``），包装只发生在这里：``wrap_group`` 恒等
+        容器（``paths=[]``/``pos=(0,0)``/``scale=1``/``angle_deg=0``），子项
+        数据零改写 ⇒ ``flatten_visible([容器])`` 与平铺逐点恒等（含折线顺序）。
+
+        「严禁逐 Item 归位」的导入期语义仍由既有 :func:`_import_group` 契约
+        承担（``_finish`` 内已做组级一次归位）；容器只把「相对布局不散」从
+        契约升级为**结构属性**（FR-07 v1.2 裁决：组变换走叶子集合，容器恒等）。
+        """
+        from megapro.gui.layout.doc_import import DocImportDialog, wrap_group
 
         dlg = DocImportDialog(self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         items = dlg.items()
-        if items:
-            for it in items:
-                it.z = self.doc.top_z() + 1
-            self._add_items(items, "导入Word/Excel")
+        if not items:
+            return
+        top_z = self.doc.top_z()
+        for it in items:
+            it.z = top_z + 1
+        cont = wrap_group(items, name="导入组")
+        self._add_items([cont], "导入Word/Excel")
+        for it in items:
+            gi = self._gi_for(it)
+            if gi is not None:
+                gi.setSelected(True)
+        self._after_change()
 
     # -- 绘制预览（供 canvas 调用；坐标 = 纸面 mm 浮点） --------------------
 
@@ -978,8 +1324,12 @@ class LayoutPage(QtWidgets.QWidget):
 
     def _on_export(self) -> None:
         self._sync_models()
-        for it in self.doc.items_visible():
-            x0, y0, x1, y1 = it.page_bbox()
+        # 越界预检：走 :meth:`_page_box`（含祖先链）—— 裸 ``it.page_bbox()`` 在
+        # 非恒等容器下对组内叶子报局部坐标 → 编组后漏报（M1 缺口 #1）。
+        # ⚠ 已知口径（不在本里程碑范围）：此处**只警告**，随后无条件
+        # ``export_requested.emit`` —— 从不真正拦截越界导出。
+        for it, _chain in iter_units(self.doc.items, visible_only=True):
+            x0, y0, x1, y1 = it.unit_page_bbox(_chain)
             if x0 < 0 or y0 < 0 or x1 > BED_W or y1 > BED_H:
                 QtWidgets.QMessageBox.warning(
                     self, "越界",

@@ -21,6 +21,7 @@ __all__ = [
     "key_points",
     "snap_to_objects",
     "grid_pitch_mm",
+    "snap_candidate_paths",
 ]
 
 Point = tuple[float, float]
@@ -130,3 +131,32 @@ class SnapEngine:
             if hit is not None:
                 return hit
         return snap_point(pt, self.pitch)
+
+
+def snap_candidate_paths(doc, *, exclude=None) -> Path2D:
+    """文档的**页面系**对象吸附候选（FR-06 前置修复，拖动侧与绘制侧共用一份）。
+
+    旧实现两侧域不一致且各写一套：
+    - 绘制侧 ``LayoutPage._all_paths`` 返回 ``it.paths``（**局部**坐标），
+      而 ``_snap_pt`` 喂入的是**页面**坐标 → 局部候选对页面点恒零命中
+      （离屏探针：``pos=(50,60)`` 的图元、页面点 (51,61) → 局部零命中、
+      页面域命中 ``(51.0,60.0)``）；
+    - 拖动侧 ``PathItem._snap_value`` 遍历 ``doc.items`` → **漏掉组内叶子**
+      （不在顶层列表里）且**把隐藏图元算进候选**。
+
+    本函数按 :func:`iter_flattens` 全树取**可见**单元（含组内叶子、含容器
+    自身折线），并施加完整祖先链变换 ⇒ 候选恒为页面系。``exclude`` 排除正在
+    被拖动的那个图元自身。
+    """
+    from megapro.gui.layout.model import iter_flattens, unit_paths
+
+    if doc is None:
+        return []
+    out: Path2D = []
+    for it, paths, chain in iter_flattens(doc.items, visible_only=True):
+        if exclude is not None and it is exclude:
+            continue
+        if not paths:
+            continue
+        out.extend(unit_paths(it, chain))  # 页面系（含祖先链）
+    return out

@@ -25,6 +25,11 @@ __all__ = [
 _BIN_DIR = Path(__file__).resolve().parent.parent.parent.parent / "bin"
 _NUM = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
+#: 多阈值灰阶分档（0–255 灰度值，**与床尺寸无关**）：90/130/170/210（等差 40）。
+#: §8.4 常量收敛后 src 不留裸 210 数值字面（那是 canvas/coords.py 的
+#: BED_W/BED_H 唯一定义处），故写成等差式生成，取值逐个不变。
+GRAY_THRESHOLDS = tuple(90 + 40 * k for k in range(4))
+
 
 def find_potrace(exe: str | Path | None = None) -> str | None:
     """探测 potrace 可执行文件；找不到返回 None。"""
@@ -331,7 +336,7 @@ def trace_image_multi(
     *,
     target_mm: float = 180.0,
     max_px: int = 1000,
-    thresholds=(90, 130, 170, 210),
+    thresholds=GRAY_THRESHOLDS,
     turdsize: int = 4,
     potrace: str | Path | None = None,
     keep_files: bool = False,

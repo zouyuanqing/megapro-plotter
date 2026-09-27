@@ -1,5 +1,10 @@
 # PRD：Mega Pro 写字 / 裁纸上位机（Host App）
 
+> **状态注记（2026-09-23）**：预览与排版重构已落地（阶段 1–5），本文中的
+> 流程/约定若有与代码不符处**以 `AGENTS.md` 与 `docs/preview-layout-blueprint.md`
+> 为准**（现行约定：canvas/coords.py 唯一坐标权威、JobSpec+`_recompile`
+> 单一编译汇流、预览≡发送、对准工具 + homed 门禁、机器绝对 Z 映射）。
+
 - 日期：2026-09-07　·　版本：v0.2（定稿，待终审）
 - 目标设备：Anycubic Mega Pro（Trigorilla / ATmega2560），原厂 Marlin 1.1.0-RC8（V1.2.9）USB 串口（250000 baud），不改固件、不改硬件
 - 现状底座：`src/megapro` CLI + SVG→G-code 工具链 + 工具路径 SVG 预览 + 33 项测试全绿（Python 3.14 + pyserial 3.5；PySide6 6.11.2 已装）

@@ -140,6 +140,12 @@ def test_worker_open_send_poll_estop(app, sim):
 
     w.estop()
     assert "ESTOP" in box["states"]
+    # M112 是裸发不等回执（CLI estop 语义），MarlinSim 收包线程异步落账 →
+    # 有界等待后再断言「M112 是最后到达的行」（消时序 flake，断言语义不变）
+    for _ in range(50):
+        if sim.received and sim.received[-1] == "M112":
+            break
+        _flush(5)
     assert sim.received and sim.received[-1] == "M112"
 
     w.close()
@@ -186,6 +192,60 @@ def test_send_sequence_interrupts_on_guard_reject(app, sim):
     assert "BUSY" in box["states"], box["states"]
     assert box["states"][-1] == "READY"
     w.close()
+
+
+def test_sequence_done_ok_true_on_full_success(app, sim):
+    """sequenceDone 双分支·成功：每行 send_line 都成功 → sequenceDone(True)。"""
+    w = SerialWorker(
+        f"socket://127.0.0.1:{sim.port}",
+        None,
+        open_session=lambda port, baud, log=None: _open_link_to_sim(port, baud, log),
+    )
+    box = {"done": []}
+    w.sequenceDone.connect(lambda ok: box["done"].append(ok))
+    w.open()
+    w.send_sequence(["G0 X5 F600", "G0 X6 F600", "M400"], home=False)
+    _flush()
+    assert box["done"] == [True], box["done"]
+    w.close()
+
+
+def test_sequence_done_ok_false_when_guard_blocks_half(app, sim):
+    """sequenceDone 双分支·中断：guard 拦一半（G28 Z 未 allow_z）→ ok=False。
+
+    复刻评审 break #6 场景：前半行已发出（=拦一半），被拦行及其后行不得发，
+    sequenceDone 必须带 ok=False —— GUI 的 homed 门禁据此不置位
+    （窗口侧见 tests/test_gui_alignment.py::test_guard_half_block_keeps_unhomed_end_to_end）。
+    """
+    w = SerialWorker(
+        f"socket://127.0.0.1:{sim.port}",
+        None,
+        allow_z=False,  # G28 Z 将被 guard 拦
+        open_session=lambda port, baud, log=None: _open_link_to_sim(port, baud, log),
+    )
+    box = {"done": []}
+    w.sequenceDone.connect(lambda ok: box["done"].append(ok))
+    w.open()
+    before = len(sim.received)
+    w.send_sequence(["G0 X5 F600", "G28 X Y", "G28 Z", "G0 X99 F600"], home=True)
+    _flush()
+    got = sim.received[before:]
+    assert "G0 X5 F600" in got and "G28 X Y" in got  # 前半已发
+    assert "G28 Z" not in got  # 被拦未发
+    assert "G0 X99 F600" not in got  # 中断后不得续发
+    assert box["done"] == [False], box["done"]
+    w.close()
+
+
+def test_send_sequence_without_session_emits_done_false(app):
+    """入口早退（未开会话/已急停）也发 sequenceDone(False)：序列一行未成功，
+    docstring「无论结果都发」与行为一致（评审 low #3），GUI 在途归位标记无需
+    靠状态变化兜底清理。"""
+    w = SerialWorker("FAKE", None)
+    box = {"done": []}
+    w.sequenceDone.connect(lambda ok: box["done"].append(ok))
+    w.send_sequence(["G0 X1 F600"], home=True)  # 未 open → 早退
+    assert box["done"] == [False]
 
 
 def test_run_job_progress_and_done(app, sim):

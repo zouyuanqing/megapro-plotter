@@ -2,7 +2,12 @@
 
 - .docx：python-docx 读段落/表格 → 文字轮廓/单线 + 表格边框线。
 - .xlsx：openpyxl 读单元格/合并/列宽/行高 → 表格网格线 + 单元格文字。
-- 自适应床面：整体缩放到 fit 210×210（保持比例、居中）。
+- 自适应床面：整体缩放到 fit 210×210（保持比例、居中，:func:`_fit_to_bed`）。
+- **入库走组导入契约**（阶段 2，§2.2/§2.3 #7）：生成方保持 y-down 排版
+  （段落/表格行序 = y-down 图像序），入库时整组 ``paper_from_svg_ydown`` →
+  组级一次 ``place_at_anchor``（保 ``_fit_to_bed`` 后的相对布局）→ 逐 Item
+  ``normalize_local`` —— 严禁逐 Item 归位（段落/表格会塌到原点）。Word/Excel
+  在纸面视图/导出里因此**正立**（第一段/第一行在上）。
 """
 
 from __future__ import annotations
@@ -12,8 +17,8 @@ from pathlib import Path
 
 from PySide6 import QtWidgets
 
-from megapro.gui.layout.model import BED_H, BED_W, Item
-from megapro.gui.layout.layout_page import _svg_to_paths
+from megapro.gui.layout.model import BED_H, BED_W, Item, normalize_local
+from megapro.gui.layout.layout_page import _svg_to_paths, _group_paths_to_paper
 from megapro.gui.text_to_svg import (
     find_cjk_font, text_outline_svg, text_singleline_svg,
 )
@@ -156,7 +161,13 @@ def _table_to_items(grid: list[list[str]], *, mode: str, size_mm: float,
 
 
 def _finish(items: list[Item]) -> list[Item]:
-    """把所有 items 的路径汇总 fit 到床面（整体缩放居中）。"""
+    """fit 到床面后按**组导入契约**入库（页面几何保持、行序正立）。
+
+    ① 整组 ``paper_from_svg_ydown``（y-down → 纸面 y-up）；
+    ② 组级**一次** ``place_at_anchor``（mc → 床中心：保持 _fit_to_bed 的
+       居中语义；严禁逐 Item 归位）；
+    ③ 逐 Item ``normalize_local``（局部重锚，页面几何不变）。
+    """
     all_paths = [p for it in items for p in it.paths]
     fitted, _ = _fit_to_bed(all_paths)
     i = 0
@@ -164,6 +175,12 @@ def _finish(items: list[Item]) -> list[Item]:
         n = len(it.paths)
         it.paths = fitted[i:i + n]
         i += n
+    groups = _group_paths_to_paper(
+        [it.paths for it in items], anchor="mc",
+        target=(BED_W / 2, BED_H / 2))
+    for it, paths in zip(items, groups):
+        it.paths = paths
+        normalize_local(it)
     return items
 
 

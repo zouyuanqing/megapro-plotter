@@ -47,7 +47,9 @@ class SerialWorker(QObject):
     status = Signal(str)
     position = Signal(object, object, object)
     log = Signal(str)
-    sequenceDone = Signal()  # send_sequence 全部行发送完成（含被 guard 拦停）
+    # send_sequence 结束（含被 guard 拦停）：True=序列每行 send_line 都成功；
+    # False=中途被 guard 拦/超时/链路异常/急停而中断（GUI 的 homed 门禁只认 ok=True）
+    sequenceDone = Signal(bool)
     progress = Signal(int, int)  # job 进度 (i, total)
     jobDone = Signal(bool)  # job 结束：True=完成 / False=中止或出错
 
@@ -211,23 +213,31 @@ class SerialWorker(QObject):
 
         home=True 时按归位序列处理：G28 行给 70s 超时（否则 30s 会误报）。
         序列执行期间状态置 BUSY，结束后回 READY（若仍连接且未急停）；
-        无论结果都发 sequenceDone（供 UI 恢复）。
+        无论结果都发 sequenceDone(ok)（供 UI 恢复 + homed 门禁判据）：
+        ok=True **仅当序列每行 send_line 都成功**（空/注释行视为已处理）；
+        被 guard 拦一半的序列必为 ok=False，GUI 不得当成功（评审 break #6）。
+        入口早退（会话已关/已急停）同样发 sequenceDone(False)：序列一行未成功，
+        且让 GUI 的在途归位标记不必靠状态变化兜底清理（评审 low #3）。
         """
         if self._session is None or self._estop_sent:
+            self.sequenceDone.emit(False)
             return
         self._set_state("BUSY")
+        ok = True
         for line in lines:
             if self._session is None or self._estop_sent:
+                ok = False
                 break
             is_g28 = line.strip().upper().startswith("G28")
             timeout = 70.0 if (home or is_g28) else None
             if not self.send_line(line, timeout=timeout):
+                ok = False
                 break  # guard 拦 / 超时 / 链路 / 急停 → 中断剩余行
         # 结束后恢复：若仍连接且未被急停/故障锁死，回 READY
         if self._session is not None and not self._estop_sent \
                 and self._state not in ("FAULT", "ESTOP"):
             self._set_state("READY")
-        self.sequenceDone.emit()
+        self.sequenceDone.emit(ok)
 
     @Slot()
     def poll_position(self) -> None:

@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from megapro.gui.canvas.coords import BED_W
+
 __all__ = [
     "PRESETS_DIR",
     "DEFAULT_CONFIG",
@@ -44,7 +46,7 @@ DEFAULT_CONFIG: dict = {
     "travel_lift_mm": 5.0,
     "pen_diameter_mm": 0.5,
     "material": "A4",
-    "material_w": 210.0,
+    "material_w": BED_W,
     "material_h": 297.0,
     "material_margin": 5.0,
     "cut_depth_mm": 0.5,
@@ -109,7 +111,7 @@ def apply_config(mw, cfg: dict) -> None:
     mw._travel_lift_mm = float(cfg.get("travel_lift_mm", 5.0))
     mw._pen_diameter_mm = float(cfg.get("pen_diameter_mm", 0.5))
     mw._material = cfg.get("material", "A4")
-    mw._material_w = float(cfg.get("material_w", 210.0))
+    mw._material_w = float(cfg.get("material_w", BED_W))
     mw._material_h = float(cfg.get("material_h", 297.0))
     mw._material_margin = float(cfg.get("material_margin", 5.0))
     mw._opt_dedup = bool(cfg.get("opt_dedup", False))
@@ -130,7 +132,7 @@ def apply_config(mw, cfg: dict) -> None:
     if hasattr(mw, "cut_depth_spin") and "cut_depth_mm" in cfg:
         mw.cut_depth_spin.setValue(float(cfg.get("cut_depth_mm", 0.5)))
     mw._refresh_tool_info()
-    mw._on_clear_job()
+    mw._on_preset_applied()  # 预设通道必须触发重编译（保留几何，换参数/ZMap）
     mw._append_console(f"已加载预设：{cfg.get('_name','')} "
                        f"({mw._tool}, Z标定{'✓' if mw._pen_down_z else '✗'})")
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from megapro.gui.canvas.coords import translate_paths  # re-export shim（阶段 5 删）
+
 __all__ = [
     "MachineState",
     "Action",
@@ -31,6 +33,10 @@ __all__ = [
     "build_pen_down",
     "build_pen_up",
     "build_park_sequence",
+    "build_frame_sequence",
+    "build_move_to_sequence",
+    "build_goto_origin_sequence",
+    "can_start_job",
     "sequence_ok",
     "translate_paths",
 ]
@@ -254,19 +260,75 @@ def sequence_ok(lines: list[str], *, allow_z: bool = False,
     return bad
 
 
-def translate_paths(
-    paths: list[list[tuple[float, float]]],
-    dx: float,
-    dy: float,
-) -> list[list[tuple[float, float]]]:
-    """把多段线整体平移 (dx, dy)。用于把工件坐标路径平移到机器坐标。
+def build_frame_sequence(
+    bbox_xy: tuple[float, float, float, float],
+    safe_z: float,
+    feed_xy: float = 1200.0,
+    rounds: int = 1,
+) -> list[str]:
+    """走边框 Frame：bbox 矩形环绕 G0（对准工具，零硬件/零标定）。
 
-    P1c 工件原点采用 GUI 维护偏移（不发 G92 给固件）：SVG 路径是工件坐标，
-    发机器前加偏移 = 机器坐标。返回新列表，不改入参。
+    bbox_xy = (x0, y0, x1, y1)（机器坐标，内容 bbox）；先抬到 safe_z 再走，
+    环绕 rounds 轮回到起点。只空移不下压，可循环走边让人挪纸/夹具。
     """
-    if dx == 0.0 and dy == 0.0:
-        return [list(p) for p in paths]
+    x0, y0, x1, y1 = (float(v) for v in bbox_xy)
+    if x1 < x0 or y1 < y0:
+        raise MachineError(f"bbox 顺序非法: {bbox_xy}")
+    if safe_z < 0:
+        raise MachineError("safe_z 不能为负")
+    if rounds < 1:
+        raise MachineError("rounds 需 ≥ 1")
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    lines = ["G90", f"G0 Z{_fmt3(safe_z)} F{_fmt3(_DEFAULT_FEED_Z)}"]
+    for _ in range(rounds):
+        for x, y in corners:
+            lines.append(f"G0 X{_fmt3(x)} Y{_fmt3(y)} F{_fmt3(feed_xy)}")
+    lines.append("M400")
+    return lines
+
+
+def build_move_to_sequence(
+    x: float,
+    y: float,
+    safe_z: float,
+    feed_xy: float = 1200.0,
+) -> list[str]:
+    """四角/中心点检：抬到 safe_z 后 G0 绝对定位到 (x, y)（机器坐标）。"""
+    if safe_z < 0:
+        raise MachineError("safe_z 不能为负")
     return [
-        [(x + dx, y + dy) for x, y in p]
-        for p in paths
+        "G90",
+        f"G0 Z{_fmt3(safe_z)} F{_fmt3(_DEFAULT_FEED_Z)}",
+        f"G0 X{_fmt3(x)} Y{_fmt3(y)} F{_fmt3(feed_xy)}",
     ]
+
+
+def build_goto_origin_sequence(
+    work_origin: tuple[float, float] | None,
+    safe_z: float,
+) -> list[str]:
+    """回工件原点复核：设原点后 G0 到该机器点（work_origin=None → 未设原点）。"""
+    if work_origin is None:
+        raise MachineError("未设工件原点")
+    ox, oy = work_origin
+    return build_move_to_sequence(ox, oy, safe_z)
+
+
+def can_start_job(state_name: str, homed: bool) -> str | None:
+    """执行门禁：返回中文禁用原因（None = 可执行）。
+
+    ``homed`` 仅在 home 序列 sequenceDone(ok=True) 后置位；open/FAULT/ESTOP/
+    断开清零（阶段 4 接线）。未连接/未归位一律禁执行。
+    """
+    if state_name != "READY":
+        reasons = {
+            "DISCONNECTED": "未连接",
+            "CONNECTING": "连接中，稍候",
+            "BUSY": "执行中",
+            "FAULT": "链路故障，先处理",
+            "ESTOP": "已急停，需断电重启",
+        }
+        return reasons.get(state_name, f"状态 {state_name} 不可执行")
+    if not homed:
+        return "未归位：先『一键寻零』（G28）再执行"
+    return None

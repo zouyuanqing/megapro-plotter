@@ -16,6 +16,11 @@ __all__ = ["trace_centerline", "trace_centerline_multi",
 
 import numpy as np
 
+#: 多阈值灰阶分档（0–255 灰度值，**与床尺寸无关**）：90/130/170/210（等差 40）。
+#: §8.4 常量收敛后 src 不留裸 210 数值字面（那是 canvas/coords.py 的
+#: BED_W/BED_H 唯一定义处），故写成等差式生成，取值逐个不变。
+GRAY_THRESHOLDS = tuple(90 + 40 * k for k in range(4))
+
 
 def _preprocess_gray(img):
     """灰度化。img 为 ndarray / PIL 图 / 路径。"""
@@ -155,7 +160,7 @@ def trace_centerline(img, *, max_px: int = 1200, threshold: int = 160,
 
 
 def trace_centerline_multi(img, *, max_px: int = 1200,
-                           thresholds=(90, 130, 170, 210),
+                           thresholds=GRAY_THRESHOLDS,
                            invert: bool = True, simplify_tol: float = 0.8):
     """**多阈值拼接**：对多个阈值(淡→浓)各提一次中心线，合并去重。
 
@@ -206,7 +211,7 @@ def image_to_centerline_svg(img, *, target_mm: float = 180.0,
 
 def image_to_centerline_svg_multi(img, *, target_mm: float = 180.0,
                                   max_px: int = 1200,
-                                  thresholds=(90, 130, 170, 210),
+                                  thresholds=GRAY_THRESHOLDS,
                                   simplify_tol: float = 0.8) -> str:
     """图片 → 中心线 SVG（**多阈值合并**，一次提全线条）。"""
     paths = trace_centerline_multi(img, max_px=max_px,

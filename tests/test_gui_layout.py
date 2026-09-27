@@ -38,7 +38,12 @@ def test_item_transform_scale_and_rotate():
 
 
 def test_document_export_parseable(tmp_path):
-    """导出 → parse_svg 回读坐标与预期一致（绝对值 mm）。"""
+    """导出 → parse_svg 回读 → paper_from_svg_ydown 对合还原纸面坐标（阶段 3）。
+
+    导出为 SVG y-down（y_svg = 210 − y_paper），回读经 ``paper_from_svg_ydown``
+    比对纸面值（第一条线 (10,40)-(30,40)；文件字面 y 为 170）。
+    """
+    from megapro.gui.canvas.coords import paper_from_svg_ydown
     from megapro.toolchain.svg_to_gcode import parse_svg
 
     doc = Document()
@@ -51,8 +56,8 @@ def test_document_export_parseable(tmp_path):
     p.write_text(svg, encoding="utf-8")
     polys = parse_svg(str(p))
     assert len(polys) == 2
-    # 第一条线应在 (10,40)-(30,40)
-    a, b = polys[0]
+    # 第一条线应在 (10,40)-(30,40)（纸面值；对合回读比对）
+    a, b = paper_from_svg_ydown(polys)[0]
     assert a == pytest.approx((10.0, 40.0))
     assert b == pytest.approx((30.0, 40.0))
 
@@ -106,9 +111,9 @@ def test_export_skips_hidden_and_respects_z_order():
     doc.add(Item(paths=[[(0, 5), (10, 5)]], name="hid", z=5, visible=False))
     doc.add(Item(paths=[[(0, 1), (10, 1)]], name="bot", z=1))
     svg = document_to_svg(doc)
-    # bot(z1) 在 top(z9) 之前；hidden 不出现
-    assert svg.index("0,1") < svg.index("0,0")
-    assert "0,5" not in svg
+    # bot(z1) 在 top(z9) 之前；hidden 不出现（阶段 3：y-down 字面 209/210/205）
+    assert svg.index("0,209") < svg.index("0,210")
+    assert "0,205" not in svg
 
 
 def test_export_empty_doc():
@@ -116,18 +121,44 @@ def test_export_empty_doc():
 
 
 def test_export_closes_contour():
-    # 闭合方块 → 导出应含回到起点的点
+    # 闭合方块 → 导出应含回到起点的点（阶段 3：y-down 字面 0,210）
     it = Item(paths=[[(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]])
     doc = Document()
     doc.add(it)
     svg = document_to_svg(doc)
-    assert svg.count("0,0") >= 2  # 起点出现两次（闭合回到）
+    assert svg.count("0,210") >= 2  # 起点出现两次（闭合回到）
+
+
+def test_export_svg_ydown_roundtrip(tmp_path):
+    """§8.2 具名 golden：导出 y-down ↔ 纸面 y-up 对合回读（roundtrip 恒等）。
+
+    document_to_svg → parse_svg → paper_from_svg_ydown 应逐点还原
+    flatten_visible(doc)（含 z 序拍平与变换后页面坐标）。
+    """
+    from megapro.gui.canvas.coords import paper_from_svg_ydown
+    from megapro.gui.layout.model import flatten_visible
+    from megapro.toolchain.svg_to_gcode import parse_svg
+
+    doc = Document()
+    doc.add(Item(paths=[[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]], name="a", z=1))
+    doc.add(Item(paths=[[(5.0, 15.0), (20.0, 15.0)]], name="b", z=2,
+                 pos=(3.0, 4.0), scale=2.0, angle_deg=90.0))
+    svg = document_to_svg(doc)
+    p = tmp_path / "rt.svg"
+    p.write_text(svg, encoding="utf-8")
+    back = paper_from_svg_ydown(parse_svg(str(p)))
+    flat = flatten_visible(doc)
+    assert len(back) == len(flat)
+    for pa, pb in zip(back, flat):
+        assert len(pa) == len(pb)
+        for (xa, ya), (xb, yb) in zip(pa, pb):
+            assert (xa, ya) == pytest.approx((xb, yb), abs=1e-6)
 
 
 # --- CAD 网格定价 ------------------------------------------------------------
 
 def test_grid_pitch_mm_ladder():
-    from megapro.gui.layout.canvas import grid_pitch_mm
+    from megapro.gui.canvas.snap import grid_pitch_mm
 
     # 低缩放 → 大格；高缩放 → 小格；都落在 1/2/5×10^k
     for ppm, lo, hi in ((1.0, 24, 80), (5.0, 24, 80), (40.0, 24, 80),

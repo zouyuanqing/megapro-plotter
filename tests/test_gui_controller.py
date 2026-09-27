@@ -10,13 +10,17 @@ from megapro.gui.controller import (
     MachineState,
     Action,
     assert_can,
+    build_frame_sequence,
     build_full_home_sequence,
+    build_goto_origin_sequence,
     build_home_sequence,
     build_jog_sequence,
+    build_move_to_sequence,
     build_park_sequence,
     build_pen_down,
     build_pen_up,
     can,
+    can_start_job,
     parse_position,
     sequence_ok,
     translate_paths,
@@ -182,3 +186,72 @@ def test_translate_paths_zero_is_copy():
     out = translate_paths(paths, 0.0, 0.0)
     assert out == paths
     assert out is not paths
+
+
+# --- 阶段 4 对准构造器 golden（§7 阶段 4 保绿清单） --------------------------
+
+def test_frame_move_to_goto_origin_golden():
+    """Frame/MoveTo/GotoOrigin 序列 golden：形状、角点、轮数线性。"""
+    move = build_move_to_sequence(10.0, 5.0, 30.0)
+    assert move == ["G90", "G0 Z30 F300", "G0 X10 Y5 F1200"]
+    frame = build_frame_sequence((0.0, 0.0, 20.0, 30.0), 30.0)
+    assert frame[0] == "G90"
+    assert frame[1] == "G0 Z30 F300"  # 先抬到安全 Z
+    assert frame[-1] == "M400"
+    # 矩形环绕：4 角 + 回起点
+    for corner in ("G0 X0 Y0 F1200", "G0 X20 Y0 F1200",
+                   "G0 X20 Y30 F1200", "G0 X0 Y30 F1200"):
+        assert corner in frame
+    assert len(build_frame_sequence((0.0, 0.0, 1.0, 1.0), 30.0, rounds=1)) == 8
+    assert len(build_frame_sequence((0.0, 0.0, 1.0, 1.0), 30.0, rounds=3)) == 18
+    # 回原点 = 移到工件原点的机器点
+    assert build_goto_origin_sequence((10.0, 5.0), 30.0) == \
+        build_move_to_sequence(10.0, 5.0, 30.0)
+
+
+def test_alignment_sequences_pass_guard_line_by_line():
+    """对准序列 sequence_ok(...)==[] 且逐行 guard.check 全过（含无 allow_z 场景：
+    对准序列只含非负绝对 Z，guard 的负 Z/G28-Z 规则都不触发）。"""
+    from megapro.safety.guard import check
+
+    seqs = [
+        build_frame_sequence((0.0, 0.0, 20.0, 30.0), 30.0, rounds=3),
+        build_move_to_sequence(10.0, 5.0, 30.0),
+        build_goto_origin_sequence((10.0, 5.0), 30.0),
+    ]
+    for seq in seqs:
+        assert sequence_ok(seq, allow_z=True, lift_configured=True) == []
+        assert sequence_ok(seq, allow_z=False, lift_configured=False) == []
+        for line in seq:
+            check(line, allow_z=True, lift_configured=True)  # 不抛 = 通过
+            check(line, allow_z=False, lift_configured=False)
+
+
+def test_frame_bbox_validation():
+    """bbox 参数校验：x0<=x1 且 y0<=y1，否则 MachineError（退化矩形 x0==x1 合法）。"""
+    build_frame_sequence((0.0, 0.0, 0.0, 5.0), 30.0)  # 退化（零宽）不抛
+    with pytest.raises(MachineError):
+        build_frame_sequence((5.0, 5.0, 1.0, 1.0), 30.0)  # x1<x0
+    with pytest.raises(MachineError):
+        build_frame_sequence((0.0, 9.0, 1.0, 1.0), 30.0)  # y1<y0
+    with pytest.raises(MachineError):
+        build_frame_sequence((0.0, 0.0, 1.0, 1.0), -1.0)  # safe_z 不能为负
+
+
+def test_frame_rounds_below_one_raises_in_builder():
+    """构造器 rounds<1 抛 MachineError（行为被 tests/test_gui_job.py:464-465
+    钉死）；UI 边界的「<1 归 1」归一见 tests/test_gui_alignment.py。"""
+    with pytest.raises(MachineError):
+        build_frame_sequence((0.0, 0.0, 1.0, 1.0), 30.0, rounds=0)
+    with pytest.raises(MachineError):
+        build_frame_sequence((0.0, 0.0, 1.0, 1.0), 30.0, rounds=-2)
+
+
+def test_can_start_job_reasons_are_chinese():
+    """can_start_job：None=可执行；否则中文原因（未连接/未归位…）。"""
+    assert can_start_job("READY", True) is None
+    for state in ("DISCONNECTED", "CONNECTING", "BUSY", "FAULT", "ESTOP"):
+        reason = can_start_job(state, True)
+        assert reason and any("一" <= ch <= "鿿" for ch in reason)
+    reason = can_start_job("READY", False)
+    assert "未归位" in reason

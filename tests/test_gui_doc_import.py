@@ -80,3 +80,56 @@ def test_extract_xlsx_fits_bed(tmp_path):
     xs = [x for it in items for pl in it.paths for x, y in pl]
     ys = [y for it in items for pl in it.paths for x, y in pl]
     assert max(xs) <= 210 and max(ys) <= 210
+
+
+# --- 阶段 2：行序方向断言（Word/Excel 正立，§7/§2.3 #7） ---------------------
+
+def _yc(items, name_prefix):
+    """具名图元的页面几何 y 中心（transformed_paths，纸面 y-up）。"""
+    it = next(i for i in items if i.name.startswith(name_prefix))
+    ys = [y for p in it.transformed_paths() for _, y in p]
+    return sum(ys) / len(ys)
+
+
+def _xc(items, name_prefix):
+    """具名图元的页面几何 x 中心。"""
+    it = next(i for i in items if i.name.startswith(name_prefix))
+    xs = [x for p in it.transformed_paths() for x, _ in p]
+    return sum(xs) / len(xs)
+
+
+def test_extract_docx_upright_row_order(tmp_path):
+    """Word 段落/表格行序正立：第一段/第一行在纸面 y-up 的上方。"""
+    p = _make_docx(tmp_path / "t.docx")
+    items = extract_docx(p, mode="outline", size_mm=5.0)
+    # 段落：『你好 World』在『第二段』之上
+    assert _yc(items, "段落:你好") > _yc(items, "段落:第二")
+    # 表格：第一行（A1/B1）在第二行（A2/B2）之上
+    assert _yc(items, "格:A1") > _yc(items, "格:A2")
+    assert _yc(items, "格:B1") > _yc(items, "格:B2")
+    # 相对布局保持（组契约：列序不变）
+    assert _xc(items, "格:A1") < _xc(items, "格:B1")
+    assert _xc(items, "格:A2") < _xc(items, "格:B2")
+
+
+def test_extract_xlsx_upright_row_order(tmp_path):
+    """Excel 行序正立 + 相对布局保持。"""
+    p = _make_xlsx(tmp_path / "t.xlsx")
+    items = extract_xlsx(p, mode="outline", size_mm=5.0)
+    assert _yc(items, "格:姓名") > _yc(items, "格:笔")
+    assert _yc(items, "格:数量") > _yc(items, "格:12")
+    assert _xc(items, "格:姓名") < _xc(items, "格:数量")
+    assert _xc(items, "格:笔") < _xc(items, "格:12")
+
+
+def test_extract_docx_group_layout_preserved(tmp_path):
+    """组导入契约：整组一次归位 —— 段落间距（相对布局）入库后保持非零。"""
+    p = _make_docx(tmp_path / "t.docx")
+    items = extract_docx(p, mode="outline", size_mm=5.0)
+    gap = _yc(items, "段落:你好") - _yc(items, "段落:第二")
+    assert gap > 1.0  # 不塌到同一点（严禁逐 Item 归位）
+    # 全部坐标仍在床内（fit + 组归位后）
+    for it in items:
+        for pl in it.transformed_paths():
+            for x, y in pl:
+                assert 0 <= x <= 210 and 0 <= y <= 210

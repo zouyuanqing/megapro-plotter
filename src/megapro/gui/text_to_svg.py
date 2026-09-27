@@ -20,6 +20,8 @@ import json
 import re
 from pathlib import Path
 
+from megapro.gui.canvas.coords import flip_y_scalar
+
 __all__ = [
     "find_cjk_font",
     "list_fonts",
@@ -247,10 +249,11 @@ def text_singleline_svg(
             pts = " ".join(
                 f"{_n((x + cx / size_mm))},{_n(y)}" for x, y in stroke
             )
-            # 数据 0-1 归一化 → mm：乘 size；y 翻（数据 y 上）→ 1-y
-            # 直接在坐标里算：
+            # 数据 0-1 归一化 → mm：乘 size；y 翻 = 格式编码（归一化 y-up →
+            # SVG y-down），经 coords.flip_y_scalar 唯一翻转实现（阶段 2 迁调，
+            # 数学等价：flip_y_scalar(y, 1.0) == 1.0 - y）
             pts2 = " ".join(
-                f"{_n((x * size_mm) + cx)},{_n((1.0 - y) * size_mm)}"
+                f"{_n((x * size_mm) + cx)},{_n(flip_y_scalar(y, 1.0) * size_mm)}"
                 for x, y in stroke
             )
             paths.append(f'<polyline points="{pts2}" fill="none"/>')

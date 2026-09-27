@@ -100,3 +100,107 @@ G0 Z40 F600 / G0 Y50 F600 / G0 Z-16 F600 / G0 X10 F600 / G0 Z10 F600
 2. 相机转回对准打印机（现被碰歪对着窗户），恢复抽帧确认。
 3. 重标落笔高度（2mm 步进，用户报数），回填 `pen_down_z`。
 4. 方块空跑 → 写字 → 拖刀（按 `Verification` 章节 V0→V2）。
+
+---
+
+# 2026-09-23 重构记录（预览与排版，阶段 1–5 全部落地）
+
+契约：`docs/preview-layout-blueprint.md`（§2.2 模块清单/退役表、§2.3 根因
+对照、§7 阶段 1–5、§8 测试策略）。以下为落地事实与验证结果。
+
+## 10.1 十根因 → 修复对照（均有回归测试）
+
+| # | 根因（原审计） | 修复落点 | 回归 |
+|---|---|---|---|
+| 1 | 工件原点载入时烘入、设原点不重编译 | `JobSpec.work_origin` 编译期纯平移 + `main_window._recompile()` 全触发集（含工具切换/Z 标定/预设；执行中 no-op、jobDone 补编译） | `test_gui_window.py::test_job_set_clear_origin_recompiles_lines_and_preview`、`::test_job_recompile_noop_while_running_backfills_after_done` |
+| 2 | `already_paper` 双入口 + 改参数重读已删临时文件 | 删双入口；JobSpec 内存唯一源；排版→作业 `JobSpec` 直传（无 tempfile 往返） | `::test_job_param_changes_never_reread_file`、`::test_job_layout_export_keeps_source_and_param_changes_ok` |
+| 3 | paint `(x,−y)` 与 model CCW 互为镜像 | 场景≡纸面 mm y-up，PathItem 直画、支点=本地原点 | `test_gui_layout_window.py::test_pathitem_matches_model_transform`（θ=30/90、scale≠1） |
+| 4 | `flip_y` 按床高 210 整体反射、锚点错乱 | `Placement`（preserve / anchor 九宫格）+ 预览画 bbox/锚点/三框 | `test_coords.py::test_place_at_anchor`、`test_gui_window` 载入用例 |
+| 5 | 首段漏定位 G0、裁刀在错误 XY 先下压 | emitter `cur=None`：首段必发定位 G0 且下压在其后 | `test_gui_job.py::test_first_segment_positioning_g0`、`::test_knife_plunge_after_positioning` |
+| 6 | 非零角度预览反向 | 同 #3；`gi.mapToScene ≡ model.transformed_paths` golden | 同 #3 |
+| 7 | Word/Excel 漏翻 + 另存回读再翻 | 组导入契约 `_import_group`（整组翻→组级一次归位→逐 Item 归一）；导出 y-down 对合 | `test_gui_doc_import.py` 行序断言、`test_gui_layout.py::test_export_svg_ydown_roundtrip` |
+| 8 | 拖动不回写 model、undo 误合并 | 拖动 mouseRelease → 手势 token `MoveItemsCommand`（命令写 model，多选整组一条命令） | `test_gui_layout_window.py::test_drag_writes_back_model_with_gesture_token`、`::test_two_drags_two_independent_undo_commands`、`::test_multi_drag_writes_back_whole_group` |
+| 9 | 竖标尺 0 点恒偏一个床高（label L 实落 paper 210+L） | `RulerWidget` 用 `view_from_mm` 浮点、0 刻度对齐 paper y=0 | `::test_ruler_ticks_at_paper_positions`（只断言修复后位置） |
+| 10 | 数值定位/吸附与几何脱节、多选塌缩、高不生效 | `normalize_local` + 九宫格锚点数值定位 + 多选按选择集 bbox + W/H 联动 + `SnapEngine`（网格 pitch=grid_steps minor，对象吸附端点/中点/边） | `::test_multi_select_move_no_collapse`、`::test_sp_h_scales_item`、`::test_grid_snap_draw_tool_and_item`、`::test_drag_snaps_to_object_key_points`、`::test_snap_pitch_follows_zoom`、`::test_numeric_edit_merges_undo_per_gesture` |
+
+## 10.2 阶段 1–5 概要
+
+- **阶段 1 纯逻辑地基**：`gui/canvas/coords.py`（唯一坐标/翻转权威）、
+  `gui/gcode_parse.py`（lines→Segment）、`job.py`（JobSpec/compile_job/
+  check_bounds_v2/ZMap）、`controller.py`（Frame/MoveTo/GotoOrigin/
+  can_start_job）。
+- **阶段 2 画布核心 + 排版 y-up**：`gui/canvas/{view_transform,paper_scene,
+  paper_view,rulers,items,handles,snap,undo_cmds}.py`；`layout/{model,
+  layout_page,doc_import,text_to_svg}.py` 组导入契约/拖动回写/锚点定位；
+  删 `layout/{items,canvas,undo}.py`。
+- **阶段 3 导出链统一 + 预览≡发送**：`export_svg` y-down 对合、排版
+  `JobSpec` 直传、`main_window` 单一 `_recompile()` 汇流 + PaperView/
+  GcodePathItem/LiveMarker、删 `already_paper`/`_draw_preview`/tempfile
+  往返/`job.flip_y` shim。
+- **阶段 4 对准工具 + homed 门禁**：worker `sequenceDone(bool)`（入口早退
+  也 emit False）、对准工具条、`can_start_job` 接线、`_send` 预检 allow_z
+  传 UI 真值、`_refresh_gate_ui` 统一使能（DISCONNECTED/未勾允许 Z 的 Z
+  动作禁用 + 中文原因；`self._allow_z` 死字段删除）。
+- **阶段 5（2026-09-23，本记录）收尾**：
+  1. **退役**：删 `toolchain.emit_gcode`/`svg_file_to_gcode`（连带死代码
+     `_fmt`）；`preview/to_svg.py` 的 `toolpath_to_svg`（polylines 入口）改
+     `preview_svg_from_segments(segments, *, work_origin)`（吃
+     `gcode_parse.Segment`，三色 + 工件原点十字）；`test_toolchain.py` 的
+     `test_emit_allowed_codes_and_guard`/`test_emit_pen_cycle` 随退役删除，
+     `test_preview_writes_svg` 改喂 Segment。
+  2. **常量收敛（§8.4）**：`BED_W/BED_H` 数值字面全 src 只留
+     `canvas/coords.py` 定义处——`main_window` 材料表/默认参、`presets.py`、
+     `preview/to_svg.py` 全部改引常量；`edge_to_svg/image_to_svg` 的灰阶
+     阈值 (90,130,170,210) 为同数异义（灰度值非床尺寸），改等差式
+     `GRAY_THRESHOLDS = tuple(90 + 40 * k for k in range(4))`，取值不变；
+     §8.4 白名单清空（`tests/test_coords.py::test_bed_210_literal_convergence`）。
+  3. **债务销账 C1–C8**：C1 `test_gui_job.py` 的 `paper_to_svg_ydown as
+     flip_y` 别名改正名、`test_flip_y_global`→`test_paper_to_svg_ydown_global`
+     （语义等价）；C2 `layout/model.py` 的 sys.modules 旧模块别名块与
+     `test_legacy_canvas_alias` 经核查已在此前阶段删除（断言对象已退役），
+     本次另清 `snap.py` 引用该别名的过期文案；C3 `test_export_svg_ydown_roundtrip`
+     经核查已在 `tests/test_gui_layout.py:132`（对合还原）；C4
+     `_on_check_point` 的 MachineError 兜底经核查已在
+     `main_window.py:1658`（与 _on_frame/_on_goto_origin 一致）；C5
+     `LiveMarker.set_machine` 冻结态迟到回报改为直接丢弃（不点亮置灰虚
+     十字、不位移；解冻只由 `set_stale(False)`）；C6 `send_sequence` 入口
+     早退 emit `sequenceDone(False)` 经核查已在 `worker.py:222-224`（与
+     docstring 一致）；C7 home/jog/笔/发送按钮统一使能刷新经核查已在
+     `_refresh_gate_ui`（main_window.py:1342），`self._allow_z` 死字段已删；
+     C8 三处 docstring 与实现统一（`check_bounds_v2` 判定区
+     `min(travel,material)−margin` + A4 例、`gcode_parse` 未定轴 0.0 占位
+     规则、`_placement_for_meta`/`Placement` 的「width/height 均声明
+     210×210 才 preserve」）。
+  4. **补测（§8.3）**：新增 `test_set_zoom_anchor_invariance`（恒等 +
+     锚点不变）；「多选拖动整组一条 MoveItemsCommand」「drawBackground
+     网格水平+竖直 minor/major」两条经核查已有
+     `test_multi_drag_writes_back_whole_group` / `test_paper_scene_grid_renders_both_axes`。
+  5. **文档收口**：AGENTS.md 架构重写 + 已知缺口、本记录、README.md 过期
+     内容修正、PRD.md/PRD_layout.md 顶部状态注记。
+
+## 10.3 验证结果（2026-09-23，阶段 5 实跑）
+
+- 受影响/相邻测试文件（15 个）实跑全绿：
+  `PYTHONPATH=src python -m pytest -q --basetemp=.pytest_tmp -p no:cacheprovider
+  tests/test_toolchain.py tests/test_coords.py tests/test_gui_job.py
+  tests/test_gcode_parse.py tests/test_gui_layout.py` → **71 passed**；
+  `… tests/test_gui_layout_window.py tests/test_gui_window.py
+  tests/test_gui_presets.py tests/test_gui_image.py tests/test_gui_edge.py
+  tests/test_gui_alignment.py`（加 `QT_QPA_PLATFORM=offscreen`）→ **66 passed**；
+  `… tests/test_gui_text.py tests/test_gui_doc_import.py tests/test_gui_opt.py
+  tests/test_gui_controller.py` → **45 passed**。合计 **182 passed**。
+- 全量 pytest 未由本次跑（重构流程由脚本统一跑全量门禁）。
+- 静态扫描（测试内执行）：翻转写法全 src 零命中（白名单空）、210 数值
+  字面仅 `coords.py` 定义处（白名单空）、独立 `flip_y`/`already_paper`
+  符号 src+tests 零命中 —— 由 `tests/test_coords.py::test_flip_symbol_level_zero_hit`
+  自动钉死（tokenize NAME 级，覆盖 C1 别名形态；评审 medium#1 补，
+  此前仅手工 grep）。全量计数 216 项（2026-09-23 `pytest --collect-only`
+  收集，非执行）。guard/transport/dialect 零改动。
+
+## 10.4 已知缺口（同 AGENTS.md「已知缺口/后续」）
+
+执行期 M114 轮询（动 run_job 流控，明确不做）、相机叠加、G92/WCS、
+TiledPathItem（>2000 段实测需要才做）、SVG 单位换算/越界自动裁剪/凸包
+Frame/Word·Excel 样式保真（蓝图 §9 明确不做）；真机验收清单（Frame 目视、
+设原点对准 <1mm、空跑不触纸）待现场执行。契约曾列的「拖动对象吸附/吸附
+pitch 联动/数值输入撤销合并」本树已实现（见 10.1 #10 回归列），不列缺口。

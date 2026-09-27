@@ -1,23 +1,29 @@
-"""M1a vector toolchain: SVG -> sorted polylines -> Marlin pen G-code (stdlib only)."""
+"""M1a vector toolchain: SVG -> polylines（+ 根元素尺寸声明解析 / 最近邻排序）。
+
+阶段 5 退役：``emit_gcode``/``svg_file_to_gcode``（Z0/Z1 双轨语义的 G-code
+发射器）已删 —— grep 证实无生产调用方，机器绝对 Z 的发射统一走
+``gui/job.py`` 的 ``compile_job``（emitter 由 JobSpec 参数化）。本模块只留
+纯数据侧：``parse_svg``/``parse_svg_meta``/``nearest_neighbor_sort``。
+"""
 
 from __future__ import annotations
 
 import math
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 
-__all__ = ["parse_svg", "nearest_neighbor_sort", "emit_gcode", "svg_file_to_gcode"]
+__all__ = [
+    "parse_svg",
+    "parse_svg_meta",
+    "SvgMeta",
+    "nearest_neighbor_sort",
+]
 
 _TOL = 0.05  # curve-flattening tolerance, mm
 _IDENT = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 _NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 _TOK = re.compile(r"[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
-
-def _fmt(v: float) -> str:
-    s = f"{float(v):.3f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return "0" if s in ("-0", "", "-") else s
 
 def _mul(m1, m2):
     a1, b1, c1, d1, e1, f1 = m1
@@ -219,6 +225,12 @@ def _attr(el, name, default=0.0):
     m = _NUM.search(el.get(name) or "")
     return float(m.group(0)) if m else default
 
+
+def _attr_opt(el, name):
+    """同 _attr，但缺失/无数值返回 None（尺寸声明可缺省）。"""
+    m = _NUM.search(el.get(name) or "")
+    return float(m.group(0)) if m else None
+
 def _circle_steps(r):
     step = 2 * math.acos(max(-1.0, min(1.0, 1 - _TOL / r)))
     return max(8, int(math.ceil(2 * math.pi / step))) if step > 0 else 8
@@ -299,6 +311,34 @@ def parse_svg(path):
     _walk(ET.parse(path).getroot(), _IDENT, out)
     return out
 
+
+@dataclass(frozen=True)
+class SvgMeta:
+    """SVG 根元素尺寸/视窗声明（只读；仅供 Placement 判定，不做单位换算）。
+
+    ``width_mm``/``height_mm`` = width/height 属性的数值部分（缺失 None）；
+    ``viewBox`` = (min_x, min_y, w, h) 四元组（缺失/畸形 None）。
+    """
+
+    width_mm: float | None
+    height_mm: float | None
+    viewBox: tuple[float, float, float, float] | None
+
+
+def parse_svg_meta(path) -> SvgMeta:
+    """Read *path* and return the root ``width``/``height``/``viewBox`` declarations.
+
+    只读属性（供 Placement 判定：声明 210×210 → 版面坐标即工件坐标 preserve）。
+    **不做单位换算**（§9 明确不做）：取数值部分，``mm``/无单位视为 mm，
+    ``px``/``in`` 等后缀忽略（数值原样，仅供「是否声明 210×210」判定）。
+    """
+    root = ET.parse(path).getroot()
+    vb: tuple[float, float, float, float] | None = None
+    nums = [float(v) for v in _NUM.findall(root.get("viewBox") or "")]
+    if len(nums) == 4:
+        vb = (nums[0], nums[1], nums[2], nums[3])
+    return SvgMeta(_attr_opt(root, "width"), _attr_opt(root, "height"), vb)
+
 def nearest_neighbor_sort(polylines):
     """Greedy travel sort from (0, 0); each polyline may be reversed."""
     rem = [list(p) for p in polylines if len(p) >= 2]
@@ -316,24 +356,3 @@ def nearest_neighbor_sort(polylines):
         cur = ordered[-1][-1]
     return ordered
 
-def emit_gcode(polylines, pen_up=1.0, feed_xy=1200, feed_z=300):
-    """Render *polylines* as pen G-code using the dialect header."""
-    from megapro.dialect.marlin import header_lines
-    lines = [h for h in header_lines() if h.split()[0] in ("G90", "G21", "G91")]
-    fz, fxy = _fmt(feed_z), _fmt(feed_xy)
-    for poly in polylines:
-        if not poly:
-            continue
-        lines.append(f"G0 X{_fmt(poly[0][0])} Y{_fmt(poly[0][1])}")
-        lines.append(f"G1 Z{_fmt(0)} F{fz}")
-        lines.extend(f"G1 X{_fmt(x)} Y{_fmt(y)} F{fxy}" for x, y in poly)
-        lines.append(f"G1 Z{_fmt(pen_up)} F{fz}")
-    lines.append("M400")
-    return "\n".join(lines) + "\n"
-
-def svg_file_to_gcode(path, pen_up=1.0, feed_xy=1200, feed_z=300, sort=True):
-    """Parse *path*, optionally travel-sort, and return pen G-code."""
-    polys = parse_svg(path)
-    if sort:
-        polys = nearest_neighbor_sort(polys)
-    return emit_gcode(polys, pen_up=pen_up, feed_xy=feed_xy, feed_z=feed_z)

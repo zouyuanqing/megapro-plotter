@@ -87,11 +87,61 @@ def make_gi(page, item: Item) -> PathItem | None:
 
 
 class _PageCommand(QtGui.QUndoCommand):
-    """基类：持 layout page 引用，便于增删场景项。"""
+    """基类：持 layout page 引用，便于增删场景项。
+
+    **页归属（FR-09 / PRD §11-2 定稿：单栈 + 命令页归属）**：命令在构造时
+    记下**当时所在的页下标**；``redo``/``undo`` 执行前先切到那一页，执行后
+    恢复调用者当时所在的页。
+
+    不用「每页独立栈」的理由：用户按 Ctrl+Z 的心智是**时间上的上一步**，
+    拆成每页一栈后「撤销」在页 B 上只能退 B 的历史、无法退「刚才在页 A 上
+    做的编辑」，且工具条「撤销」按钮文案/可用性要在多栈间仲裁 —— 反而更
+    易错。单栈保持一条严格时间线，页归属只保证**模型改在正确的页上**。
+
+    场景是**一个**扁平场景，故切页必然重建（``page._rebuild_scene()``）：
+    撤销一条别的页的命令时，用户会看到画面切到那一页 —— 这正是「撤销在
+    撤销那一步」的正确表现。
+    """
 
     def __init__(self, page, text: str):
         super().__init__(text)
         self.page = page
+        doc = getattr(page, "doc", None)
+        self._home_page: int = getattr(doc, "current", 0) if doc else 0
+
+    def _activate_page(self) -> int:
+        """切到本命令的归属页（若已在该页则无副作用）；返回切换前的页下标。"""
+        doc = self.page.doc
+        prev = doc.current
+        if prev != self._home_page:
+            doc.switch_page(self._home_page)
+            self.page._rebuild_scene()
+        return prev
+
+    def _restore_page(self, prev: int) -> None:
+        """执行完把视图页恢复成调用者所在的页（跨页撤销时不抢走用户位置）。"""
+        doc = self.page.doc
+        if doc.current != prev:
+            doc.switch_page(prev)
+            self.page._rebuild_scene()
+
+    def _run(self, fn) -> None:
+        """在归属页上执行 ``fn``，随后恢复调用者的页。
+
+        页面下标越界（页被删）时退回当前页执行，不抛异常 —— 页操作类命令
+        （增/删/复制/重排页）本身就会改页数，栈里更早的命令其归属页可能已
+        不存在，那时**就地**在其存在的页上撤销是唯一合理行为。
+        """
+        doc = self.page.doc
+        home = self._home_page
+        if not (0 <= home < doc.page_count):
+            home = doc.current
+            self._home_page = home
+        prev = self._activate_page()
+        try:
+            fn()
+        finally:
+            self._restore_page(prev)
 
 
 class AddItemsCommand(_PageCommand):
@@ -124,10 +174,16 @@ class AddItemsCommand(_PageCommand):
             self.page.doc.remove(top)
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         self._rebuild_scene()
         self.page._after_change()
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         self._drop_scene()
         self.page._after_change()
 
@@ -148,12 +204,18 @@ class RemoveItemsCommand(_PageCommand):
         self._infos: list[DetachInfo | None] = []
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         self._infos = []
         for it in self.items:
             self.page._remove_item_obj(it, info=self._infos)
         self.page._after_change()
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         for it, info in zip(self.items, self._infos):
             if info is not None:
                 self.page.doc.attach(it, owner=info.owner, index=info.index)
@@ -180,12 +242,18 @@ class MoveItemsCommand(_PageCommand):
         self._token = int(token) if token is not None else new_gesture_token()
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         for it, _old, new in self.moves:
             it.pos = (float(new[0]), float(new[1]))
             self.page._sync_gi(it)
         self.page._after_change()
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         for it, old, _new in self.moves:
             it.pos = (float(old[0]), float(old[1]))
             self.page._sync_gi(it)
@@ -259,9 +327,15 @@ class ChangeItemPropsCommand(_PageCommand):
         self.page._after_change()
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         self._apply(1)
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         self._apply(0)
 
 
@@ -286,9 +360,15 @@ class EditTextCommand(_PageCommand):
         self.page._after_change()
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         self._apply(self.new_paths, self.new_spec)
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         self._apply(self.old_paths, self.old_spec)
 
 
@@ -301,6 +381,9 @@ class ClearCommand(_PageCommand):
         self._infos: list[DetachInfo | None] = []
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         self.saved = list(self.page.doc.items)
         self._infos = []
         for it in list(self.saved):
@@ -308,6 +391,9 @@ class ClearCommand(_PageCommand):
         self.page._after_change()
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         for it, info in zip(self.saved, self._infos):
             if info is not None:
                 self.page.doc.attach(it, owner=info.owner, index=info.index)
@@ -338,6 +424,9 @@ class GroupCommand(_PageCommand):
             self.page._sync_gi(leaf)
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         self.container = self.page.doc.group_items(self.items, name=self.name)
         if self.container is None:
             return
@@ -345,6 +434,9 @@ class GroupCommand(_PageCommand):
         self.page._after_change()
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         if self.container is None:
             return
         self.page.doc.ungroup(self.container)
@@ -370,6 +462,9 @@ class UngroupCommand(_PageCommand):
             self.page._sync_gi(leaf)
 
     def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
         if self._owner is None and self._index is None:
             self._owner = self.page.doc.owner_of(self.container)
         self._index = self._slot()
@@ -390,6 +485,9 @@ class UngroupCommand(_PageCommand):
         return None
 
     def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
         if not self.container.children:
             # 已被别处清空（不应发生）—— 防御：不产生错误结构
             return

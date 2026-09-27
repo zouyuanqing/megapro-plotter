@@ -14,6 +14,15 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
   保持）：``rx = x1·cosθ − y1·sinθ + px``，即 y-up 下 +θ = 纸面逆时针。
 
 模型树（``docs/PRD_layout_model_tree.md`` FR-01/FR-02/FR-07，M1）：
+- **多页（FR-09，M4）**：:class:`Document` 持 ``pages: list[Page]`` +
+  ``current``，状态真正存放在 :class:`Page`（items/bed_w/bed_h）；Document 的
+  ``items``/``bed_w``/``bed_h``/``add``/``remove``/``contains``/
+  ``items_visible``/``top_z``/``bottom_z``/``group_items``/``ungroup`` 等
+  **全部委托当前页**（当前页门面）。所有消费点因此自动作用于当前页、无需改
+  动 —— 这是「``export_svg.py`` 零改动」在该门面下成立的**前提**（若门面
+  不满足，则须改 ``export_svg`` 并解冻 Document 级测试）。默认单页行为
+  **逐位不变**（``Document()`` 即一个默认页；``Document(items=[...])``
+  关键字构造保留）。
 - ``Item.children`` 非空即**容器**；叶子仍是「折线 + 变换」，无 children 的
   Item 数学**逐位不变**（既有 transform/roundtrip golden 钉死）。
 - 合成 = **父∘子**（子路径先过自身变换，再进父变换），唯一实现在
@@ -105,6 +114,7 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 
@@ -388,15 +398,35 @@ class DetachInfo:
 
 
 @dataclass
-class Document:
-    """排版文档：图元列表 + 床尺寸。原点 (0,0) = 工件原点（床左下）。"""
+class Page:
+    """一个排版页：图元列表 + 床尺寸（原点 (0,0) = 工件原点，床左下）。
+
+    状态真正存放处；:class:`Document` 持 ``pages: list[Page]`` 并把
+    ``items``/``bed_w``/``bed_h``/``top_z``… **委托当前页**（FR-09 当前页
+    门面）。历史上这些字段直接在 :class:`Document` 上，现在下沉到本页 ——
+    单页文档下两者逐位等价（``tests/test_gui_layout.py`` 全部 Document 级
+    用例不改字通过 = 门面逐位不变的可执行证明）。
+    """
 
     items: list[Item] = field(default_factory=list)
     bed_w: float = BED_W
     bed_h: float = BED_H
+    name: str = "页1"
 
-    def add(self, item: Item) -> None:
-        self.items.append(item)
+    def clone(self, *, name: str | None = None) -> "Page":
+        """深拷贝一整页（复制页用：图元与子树全部新建，身份互不共享）。
+
+        用 ``copy.deepcopy``（含 ``children`` 树）；``Item.__eq__=False``
+        使 ``deepcopy`` 走 ``__reduce_ex__`` 默认路径、按对象图逐个新建，
+        不会把两个页的图元混成同一批对象。
+        """
+        return Page(
+            items=copy.deepcopy(self.items),
+            bed_w=self.bed_w,
+            bed_h=self.bed_h,
+            name=self.name if name is None else name,
+        )
+
 
     def remove(self, item: Item) -> "DetachInfo | None":
         """按**对象身份**删除图元（顶层或组内），返回**归属信息**供 undo 复原。
@@ -593,6 +623,224 @@ class Document:
                 idx += 1
         container.children = []
         return kids
+
+
+@dataclass
+class Document:
+    """排版文档：**多页**容器 + 当前页门面。原点 (0,0) = 工件原点（床左下）。
+
+    **当前页门面（FR-09 v1.1 兼容迁移）**：``items``/``bed_w``/``bed_h``/
+    ``top_z``/``bottom_z``/``add``/``remove``/``attach``/``contains``/
+    ``items_visible``/``sorted_items``/``owner_of``/``group_items``/
+    ``ungroup`` 全部**委托当前页**（:class:`Page`）。所有消费点
+    （``export_svg`` 经 ``flatten_visible(doc)`` 读 ``doc.items``、
+    ``undo_cmds.make_gi`` 的 ``doc.contains``、``ClearCommand.saved =
+    list(doc.items)``、``layout_page`` 全文 ``self.doc.items``）因此**自动
+    作用于当前页**，无需改动它们 —— 这正是「``export_svg.py`` 零改动」在该
+    门面下成立的原因（设计约束：门面不满足则须改 ``export_svg`` 并解冻
+    Document 级测试）。
+
+    **默认单页行为逐位不变**：``Document()`` 即「一个默认页」，既有
+    ``Document(items=[...])`` 关键字构造把那些图元放进该页
+    （``tests/test_gui_layout.py`` 全部 Document 级用例不改字通过 =
+    门面逐位不变的可执行证明）。
+
+    ⚠ ``bed_w``/``bed_h`` 刻意**不**做成 property 转发：它们是 dataclass
+    字段且被 ``Document(...)`` 构造使用。改为构造时同步进页
+    （:meth:`_sync_page_bed`）、切页时同步回来。
+    """
+
+    pages: list[Page] = field(default_factory=lambda: [Page()])
+    current: int = 0
+    bed_w: float = BED_W
+    bed_h: float = BED_H
+    #: 兼容构造：``Document(items=[...])``（既有测试与 ``layout_page`` 依赖）。
+    #: 非 None 时这些图元进当前页。**不是** dataclass 字段（``items`` 是
+    #: property，同名字段会冲突），只在本类自定义 ``__init__`` 里消费。
+    _init_items: list[Item] | None = field(default=None, repr=False)
+
+    def __init__(self, pages: list[Page] | None = None, current: int = 0,
+                 bed_w: float = BED_W, bed_h: float = BED_H,
+                 items: list[Item] | None = None) -> None:
+        """**自定义构造**（不再用 dataclass 生成的 ``__init__``）。
+
+        原因：``items`` 被做成了 :attr:`items` property（当前页门面），而
+        dataclass 字段不能与 property 同名。既有代码/测试广泛使用
+        ``Document(items=[...])``，故在此显式接受该关键字并放进当前页 ——
+        单页文档下与旧行为**逐位相同**。
+        """
+        self.pages = list(pages) if pages else [Page()]
+        self.current = int(current)
+        self.bed_w = float(bed_w)
+        self.bed_h = float(bed_h)
+        self._init_items = list(items) if items is not None else None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.pages:  # Document(pages=[]) 兜底：至少一页
+            self.pages = [Page()]
+        self._clamp_current()
+        if self._init_items is not None:
+            self.page.items = list(self._init_items)
+            self._init_items = None
+        self._sync_page_bed(to_page=True)
+
+    def _clamp_current(self) -> None:
+        if not self.pages:
+            self.pages = [Page()]
+        if not (0 <= self.current < len(self.pages)):
+            self.current = 0
+
+    def _sync_page_bed(self, *, to_page: bool) -> None:
+        """床尺寸在 Document 与当前页之间同步。
+
+        ``to_page=True`` 用 Document 的值写进页（构造时）；``to_page=False``
+        用页的值写回 Document（切换页时，让门面字段跟随当前页）。
+        """
+        page = self.page
+        if to_page:
+            page.bed_w = self.bed_w
+            page.bed_h = self.bed_h
+        else:
+            self.bed_w = page.bed_w
+            self.bed_h = page.bed_h
+
+    # -- 当前页门面（全部委托到 Page） --------------------------------------
+
+    @property
+    def page(self) -> Page:
+        """当前页对象（越界自动夹到合法下标）。"""
+        self._clamp_current()
+        return self.pages[self.current]
+
+    @property
+    def items(self) -> list[Item]:
+        """当前页的顶层图元列表（**活引用**，改它即改当前页）。"""
+        return self.page.items
+
+    @items.setter
+    def items(self, value: list[Item]) -> None:
+        self.page.items = list(value)
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+    def add(self, item: Item) -> None:
+        self.page.items.append(item)
+
+    def remove(self, item: Item) -> "DetachInfo | None":
+        return self.page.remove(item)
+
+    def attach(self, item: Item, *, owner: Item | None = None,
+               index: int | None = None) -> None:
+        self.page.attach(item, owner=owner, index=index)
+
+    def sorted_items(self) -> list[Item]:
+        return self.page.sorted_items()
+
+    def items_visible(self) -> list[Item]:
+        return self.page.items_visible()
+
+    def contains(self, item: Item) -> bool:
+        return self.page.contains(item)
+
+    def top_z(self) -> float:
+        return self.page.top_z()
+
+    def bottom_z(self) -> float:
+        return self.page.bottom_z()
+
+    def owner_of(self, item: Item) -> "Item | None":
+        return self.page.owner_of(item)
+
+    def group_items(self, items, *, name: str = "组") -> Item | None:
+        return self.page.group_items(items, name=name)
+
+    def ungroup(self, container: Item) -> list[Item]:
+        return self.page.ungroup(container)
+
+    # -- 页管理（FR-09） ---------------------------------------------------
+
+    def add_page(self, *, at: int | None = None, name: str | None = None) -> int:
+        """新建空页并返回其下标（**不**切换过去）。
+
+        ``at=None`` 追加到末尾；否则插到 ``at`` 位。页名自动去重
+        （已有同名则递增）。
+        """
+        idx = len(self.pages) if at is None else max(0, min(at, len(self.pages)))
+        self.pages.insert(idx, Page(name=name or self._next_page_name()))
+        return idx
+
+    def _next_page_name(self) -> str:
+        used = {p.name for p in self.pages}
+        n = len(self.pages) + 1
+        while f"页{n}" in used:
+            n += 1
+        return f"页{n}"
+
+    def duplicate_page(self, index: int | None = None) -> int | None:
+        """复制页（深拷贝整页图元树）并返回新页下标；源页下标非法返回 None。"""
+        if index is None:
+            index = self.current
+        if not (0 <= index < len(self.pages)):
+            return None
+        clone = self.pages[index].clone(name=self._next_page_name())
+        self.pages.insert(index + 1, clone)
+        return index + 1
+
+    def remove_page(self, index: int | None = None) -> bool:
+        """删页；**至少保留一页**（最后一页不可删，返回 False）。
+
+        删当前页时把当前下标夹到合法范围（删末页 ⇒ 落到新末页）。
+        """
+        if index is None:
+            index = self.current
+        if not (0 <= index < len(self.pages)) or len(self.pages) <= 1:
+            return False
+        del self.pages[index]
+        if index < self.current:
+            self.current -= 1
+        self._clamp_current()
+        return True
+
+    def move_page(self, index: int, to: int) -> bool:
+        """页重排：把 ``index`` 页移到 ``to`` 位（越界或原地返回 False）。"""
+        if not (0 <= index < len(self.pages)):
+            return False
+        to = max(0, min(to, len(self.pages) - 1))
+        if index == to:
+            return False
+        page = self.pages.pop(index)
+        self.pages.insert(to, page)
+        if self.current == index:
+            self.current = to
+        elif index < self.current <= to:
+            self.current -= 1
+        elif to <= self.current < index:
+            self.current += 1
+        return True
+
+    def switch_page(self, index: int) -> bool:
+        """切换当前页（越界或原地返回 False，不改状态）。
+
+        切页时床尺寸**跟随页**（同步回 ``doc.bed_w/bed_h`` 门面字段）。
+        """
+        if not (0 <= index < len(self.pages)) or index == self.current:
+            return False
+        self.current = index
+        self._sync_page_bed(to_page=False)
+        return True
+
+    def page_of(self, item: Item) -> int | None:
+        """图元所属页下标（**全文档**身份查找，跨页）；不在任何页返回 None。
+
+        undo 的页归属用：命令记住「当时在哪一页」，撤销时据此回原页。
+        """
+        for i, page in enumerate(self.pages):
+            if any(cur is item for cur in iter_items(page.items)):
+                return i
+        return None
 
 
 def iter_items(items: list[Item], *, _depth: int = 0):

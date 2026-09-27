@@ -53,6 +53,7 @@ from megapro.gui.canvas.undo_cmds import (
     MoveItemsCommand,
     RemoveItemsCommand,
     UngroupCommand,
+    make_gi,
     new_gesture_token,
 )
 from megapro.gui.layout.export_svg import document_to_svg
@@ -241,6 +242,7 @@ class LayoutPage(QtWidgets.QWidget):
         self._prop_sender = None
         self._undo = QtGui.QUndoStack(self)
         self._build_ui()
+        self._refresh_page_bar()  # 建首个页签（默认单页）
         self._refresh_props()
         self._refresh_undo_actions()
 
@@ -490,6 +492,7 @@ class LayoutPage(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         root = QtWidgets.QVBoxLayout(self)
         root.addWidget(self._build_toolbar())
+        root.addWidget(self._build_page_bar())
         self.scene = PaperScene(self)
         self.view = PaperView(self.scene, self)
         self.view.set_tool(TOOL_SELECT)
@@ -510,6 +513,103 @@ class LayoutPage(QtWidgets.QWidget):
         canvas_box.setColumnStretch(1, 1)
         root.addLayout(canvas_box, 1)
         root.addWidget(self._build_props())
+
+    def _build_page_bar(self) -> QtWidgets.QWidget:
+        """页签条（FR-09）：页签 + 增/删/复制/左移/右移。
+
+        页签是 ``QTabBar``（点即切换；**不要**用 QTabWidget 的页面栈 ——
+        场景是**一个**扁平场景，页切换靠 :meth:`_rebuild_scene`，不是换 QWidget）。
+        """
+        bar = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        self._page_bar = QtWidgets.QTabBar(bar)
+        self._page_bar.currentChanged.connect(self._on_page_tab_changed)
+        row.addWidget(QtWidgets.QLabel("页:"))
+        row.addWidget(self._page_bar, 1)
+        for text, fn in (("＋", self._on_page_add), ("－", self._on_page_del),
+                         ("复制", self._on_page_dup), ("◀", self._on_page_left),
+                         ("▶", self._on_page_right)):
+            b = QtWidgets.QPushButton(text)
+            b.setFixedWidth(52 if len(text) > 1 else 30)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        return bar
+
+    def _refresh_page_bar(self) -> None:
+        """页签与当前页对齐（用 ``blockSignals`` 避免触发切页副作用）。"""
+        bar = getattr(self, "_page_bar", None)
+        if bar is None:
+            return
+        bar.blockSignals(True)
+        try:
+            while bar.count() > 0:  # QTabBar 无 clear()，逐个 removeTab
+                bar.removeTab(0)
+            for i, page in enumerate(self.doc.pages):
+                bar.addTab(f"{i + 1} {page.name}")
+            bar.setCurrentIndex(self.doc.current)
+        finally:
+            bar.blockSignals(False)
+
+    # -- 页管理（FR-09） ----------------------------------------------------
+
+    def _on_page_tab_changed(self, index: int) -> None:
+        if self.doc.switch_page(index):
+            self._rebuild_scene()
+            self._after_change()
+
+    def _on_page_add(self) -> None:
+        idx = self.doc.add_page(at=self.doc.current + 1)
+        self._refresh_page_bar()
+        self._page_bar.setCurrentIndex(idx)
+        self._rebuild_scene()
+        self._after_change()
+
+    def _on_page_del(self) -> None:
+        if not self.doc.remove_page():
+            self.status_message.emit("至少保留一页")
+            return
+        self._refresh_page_bar()
+        self._page_bar.setCurrentIndex(self.doc.current)
+        self._rebuild_scene()
+        self._after_change()
+
+    def _on_page_dup(self) -> None:
+        idx = self.doc.duplicate_page()
+        if idx is None:
+            return
+        self._refresh_page_bar()
+        self._page_bar.setCurrentIndex(idx)
+        self._rebuild_scene()
+        self._after_change()
+
+    def _on_page_left(self) -> None:
+        self._move_page(self.doc.current - 1)
+
+    def _on_page_right(self) -> None:
+        self._move_page(self.doc.current + 1)
+
+    def _move_page(self, to: int) -> None:
+        """页重排：模型层改序后**重挂当前页**（页内容随之移动，场景全量重建）。"""
+        if not self.doc.move_page(self.doc.current, to):
+            return
+        self._refresh_page_bar()
+        self._page_bar.setCurrentIndex(self.doc.current)
+        self._rebuild_scene()
+        self._after_change()
+
+    def _rebuild_scene(self) -> None:
+        """场景全量重建 = 清场景 → 按当前页逐叶子 ``make_gi``（FR-09 页切换）。
+
+        渲染单元仍是 :func:`iter_leaves`（容器不建 PathItem，M1/M2 契约），
+        只吃**当前页**（``doc.items`` 已是当前页门面）。
+        """
+        for gi in list(self._scene_items):
+            self.scene.removeItem(gi)
+        self._scene_items.clear()
+        for leaf in iter_leaves(self.doc.items):
+            make_gi(self, leaf)
+        self._refresh_page_bar()
 
     def _build_toolbar(self) -> QtWidgets.QWidget:
         """工具条：QToolBar（自带溢出「»」），避免按钮过多撑宽窗口。"""

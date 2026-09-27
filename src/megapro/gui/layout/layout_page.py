@@ -52,6 +52,7 @@ from megapro.gui.canvas.undo_cmds import (
     GroupCommand,
     MoveItemsCommand,
     RemoveItemsCommand,
+    RetraceImageCommand,
     UngroupCommand,
     make_gi,
     new_gesture_token,
@@ -1190,27 +1191,128 @@ class LayoutPage(QtWidgets.QWidget):
             it.z = self.doc.top_z() + 1
             self._add_items([it], "加文字")
 
+    # -- 图片 → 线条（FR-10：多模式 + 可重追） -------------------------------
+
+    #: 加图模式 → (显示名, spec 里的 mode 值)
+    _IMAGE_MODES = (
+        ("中心线（骨架，消双线）", "center"),
+        ("区域轮廓（potrace，双线）", "outline"),
+        ("照片/素描（Canny+骨架）", "canny"),
+    )
+
+    def _trace_image(self, source: str, *, mode: str, threshold: int,
+                     use_multi: bool, target_mm: float,
+                     low: int | None = None, high: int | None = None
+                     ) -> str:
+        """按模式产出 SVG。**唯一**的产线分派（导入与重追共用，不各写一套）。"""
+        if mode == "center":
+            if use_multi:
+                from megapro.gui.edge_to_svg import image_to_centerline_svg_multi
+                return image_to_centerline_svg_multi(source, target_mm=target_mm)
+            from megapro.gui.edge_to_svg import image_to_centerline_svg
+            return image_to_centerline_svg(source, target_mm=target_mm,
+                                           threshold=threshold)
+        if mode == "canny":
+            # FR-10：照片/素描用 Canny+骨架（低对比友好、单像素宽）；多阈值
+            # 对该管线无意义（阈值是梯度对），故一律走单档。
+            from megapro.gui.edge_to_svg import image_to_canny_centerline_svg
+            kw = {}
+            if low is not None:
+                kw["low"] = int(low)
+            if high is not None:
+                kw["high"] = int(high)
+            return image_to_canny_centerline_svg(source, target_mm=target_mm, **kw)
+        if use_multi:
+            from megapro.gui.image_to_svg import trace_image_multi
+            return trace_image_multi(source, target_mm=target_mm)
+        from megapro.gui.image_to_svg import trace_image
+        return trace_image(source, target_mm=target_mm, threshold=threshold)
+
+    def _image_spec(self, source: str, *, mode: str, threshold: int,
+                    use_multi: bool, target_mm: float,
+                    low: int | None, high: int | None) -> dict:
+        """产线参数回执（FR-10：``Item.image_spec``，仿 ``text_spec``）。"""
+        spec = {"source": str(source), "mode": mode,
+                "threshold": int(threshold), "multi": bool(use_multi),
+                "target_mm": float(target_mm)}
+        if mode == "canny":
+            spec["low"] = int(low) if low is not None else None
+            spec["high"] = int(high) if high is not None else None
+        return spec
+
     def _add_image(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "选择图片", "", "图片 (*.png *.jpg *.jpeg *.bmp);;所有文件 (*)")
         if not path:
             return
+        mode, threshold, use_multi, target_mm, low, high = self._ask_image_params(
+            default_source=None)
+        if mode is None:
+            return
+        try:
+            svg = self._trace_image(path, mode=mode, threshold=threshold,
+                                    use_multi=use_multi, target_mm=target_mm,
+                                    low=low, high=high)
+            paths = _svg_to_paths(svg)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "图片转线条失败",
+                f"{exc}\n（中心线需 scikit-image；potrace 需 bin/potrace.exe；"
+                "Canny 需 opencv-python + scikit-image）")
+            return
+        if not paths:
+            QtWidgets.QMessageBox.warning(self, "无线条", "阈值后没有可追踪的线条")
+            return
+        # **全部折线**进模型（FR-10 坑 1）：旧实现 `_import_group([paths],
+        # ...)[0]` 只取第 [0] 条、其余静默丢弃 —— 而 Canny+骨架必然产出多条
+        # 折线（一个物体一条），那样 US-5「照片调参重追」直接残废。这里把
+        # paths 作为**单个**图元的多条折线（_import_group 长度为 1 ⇒ 一项）。
+        it = _import_group([paths], name=f"图:{Path(path).name[:8]}")[0]
+        it.z = self.doc.top_z() + 1
+        it.image_spec = self._image_spec(
+            path, mode=mode, threshold=threshold, use_multi=use_multi,
+            target_mm=target_mm, low=low, high=high)
+        self._add_items([it], "加图片")
+
+    def _ask_image_params(self, *, default_source: str | None = None,
+                          spec: dict | None = None) -> tuple | None:
+        """加图/重追共用参数对话框；返回 ``(mode, threshold, multi, mm, low,
+        high)``，用户取消返回 ``None``。
+
+        ``spec``（重追时 = ``item.image_spec``）非空则**预填**各控件：模式/
+        阈值/多阈值/最长边/Canny 阈值都回到上次用的值，用户只改要改的那一项
+        （US-5「刻完后调阈值重追」的前提是其余参数不丢）。
+        """
+        spec = dict(spec or {})
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("图片→线条参数")
         form = QtWidgets.QFormLayout(dlg)
         mode = QtWidgets.QComboBox()
-        mode.addItem("中心线（骨架，消双线）", "center")
-        mode.addItem("区域轮廓（potrace，双线）", "outline")
+        for label, value in self._IMAGE_MODES:
+            mode.addItem(label, value)
+        # 预填：spec 里的 mode（不在列表里则留默认第一项）
+        if spec.get("mode") in [v for _l, v in self._IMAGE_MODES]:
+            mode.setCurrentIndex([v for _l, v in self._IMAGE_MODES]
+                                 .index(spec["mode"]))
         form.addRow("模式:", mode)
         multi = QtWidgets.QCheckBox("多阈值合并（一次提全淡→浓所有线条）")
+        multi.setChecked(bool(spec.get("multi", False)))
         form.addRow(multi)
         th = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         th.setRange(0, 255)
-        th.setValue(160)
+        th.setValue(int(spec.get("threshold", 160)))
         form.addRow("阈值(暗→线，未勾多阈值时用):", th)
+        lo = QtWidgets.QSpinBox()
+        lo.setRange(0, 255)
+        lo.setValue(int(spec.get("low") or 50))
+        form.addRow("Canny 低阈:", lo)
+        hi = QtWidgets.QSpinBox()
+        hi.setRange(0, 255)
+        hi.setValue(int(spec.get("high") or 120))
+        form.addRow("Canny 高阈:", hi)
         mm = QtWidgets.QDoubleSpinBox()
         mm.setRange(10, BED_W)
-        mm.setValue(100.0)
+        mm.setValue(float(spec.get("target_mm", 100.0)))
         form.addRow("最长边(mm):", mm)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok
                                         | QtWidgets.QDialogButtonBox.Cancel)
@@ -1218,39 +1320,9 @@ class LayoutPage(QtWidgets.QWidget):
         bb.rejected.connect(dlg.reject)
         form.addRow(bb)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return
-        md = mode.currentData()
-        threshold = th.value()
-        use_multi = multi.isChecked()
-        try:
-            if md == "center":
-                if use_multi:
-                    from megapro.gui.edge_to_svg import image_to_centerline_svg_multi
-                    svg = image_to_centerline_svg_multi(path, target_mm=mm.value())
-                else:
-                    from megapro.gui.edge_to_svg import image_to_centerline_svg
-                    svg = image_to_centerline_svg(path, target_mm=mm.value(),
-                                                  threshold=threshold)
-            else:
-                if use_multi:
-                    from megapro.gui.image_to_svg import trace_image_multi
-                    svg = trace_image_multi(path, target_mm=mm.value())
-                else:
-                    from megapro.gui.image_to_svg import trace_image
-                    svg = trace_image(path, target_mm=mm.value(),
-                                      threshold=threshold)
-            paths = _svg_to_paths(svg)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(
-                self, "图片转线条失败",
-                f"{exc}\n（中心线需 scikit-image；potrace 需 bin/potrace.exe）")
-            return
-        if not paths:
-            QtWidgets.QMessageBox.warning(self, "无线条", "阈值后没有可追踪的线条")
-            return
-        it = _import_group([paths], name=f"图:{Path(path).name[:8]}")[0]
-        it.z = self.doc.top_z() + 1
-        self._add_items([it], "加图片")
+            return None
+        return (mode.currentData(), th.value(), multi.isChecked(), mm.value(),
+                lo.value(), hi.value())
 
     def _add_svg(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1416,11 +1488,46 @@ class LayoutPage(QtWidgets.QWidget):
     def _zoom_100(self) -> None:
         self.view.set_zoom(1.0)
 
-    # -- 双击重编文字 ------------------------------------------------------
+    # -- 双击重编文字 / 重追图片 --------------------------------------------
 
     def edit_text_item(self, item: Item) -> None:
         if item.text_spec:
             self._add_text(edit_item=item)
+
+    def retrace_image_item(self, item: Item) -> None:
+        """图片**就地重追**（FR-10 / US-5）：调阈值/模式后重出线条。
+
+        - 源图从 ``item.image_spec['source']`` 取（FR-10：记 spec 就不用
+          重新导入重摆）；
+        - 走 :class:`RetraceImageCommand`（显式 ``rebuild_path`` 通道，坑 2）；
+        - **pos / scale / angle_deg 保持不变**（只换 paths + spec）。
+        """
+        spec = item.image_spec or {}
+        source = spec.get("source")
+        if not source or not Path(source).exists():
+            QtWidgets.QMessageBox.warning(
+                self, "无法重追", f"源图片不存在或未记录：{source or '（无）'}")
+            return
+        params = self._ask_image_params(default_source=source, spec=spec)
+        if params is None:
+            return
+        mode, threshold, use_multi, target_mm, low, high = params
+        try:
+            svg = self._trace_image(source, mode=mode, threshold=threshold,
+                                    use_multi=use_multi, target_mm=target_mm,
+                                    low=low, high=high)
+            paths = _svg_to_paths(svg)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "重追失败", str(exc))
+            return
+        if not paths:
+            QtWidgets.QMessageBox.warning(self, "无线条", "新参数下没有可追踪的线条")
+            return
+        new_spec = self._image_spec(
+            source, mode=mode, threshold=threshold, use_multi=use_multi,
+            target_mm=target_mm, low=low, high=high)
+        self._undo.push(RetraceImageCommand(self, item, paths, new_spec,
+                                            "重追图片"))
 
     # -- 导出 --------------------------------------------------------------
 

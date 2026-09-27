@@ -258,6 +258,10 @@ class Item:
     locked: bool = False  # 锁定（不可选中/移动）
     visible: bool = True  # 隐藏则导出/显示都跳过（含整棵子树）
     text_spec: dict | None = None  # 文字源信息（可重编）：见 text_to_svg
+    # 图片源参数（可重追，FR-10）：``{source, mode, threshold, multi,
+    # target_mm, low, high, aperture_size}``。仿 ``text_spec`` 先例（D6）——
+    # 记下产线参数即可**就地重追**，不必重新导入重摆。
+    image_spec: dict | None = None
     children: list["Item"] = field(default_factory=list)  # 非空即容器
     # 镜像（FR-08）：支点 = **本地 bbox 中心**（一般式，v1.3 定稿），
     # pos/scale/angle **不补偿**（原位镜像：内容绕自身中心像点翻转，仅标志

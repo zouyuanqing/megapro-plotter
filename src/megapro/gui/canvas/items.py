@@ -153,7 +153,7 @@ class PathItem(QtWidgets.QGraphicsPathItem):
         self.commit_move()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        """双击：先问排版页（组编辑态进入），否则重编文字（page.edit_text_item 回调）。"""
+        """双击：组编辑态 → 文字重编 → 图片重追（page 回调链）。"""
         page = getattr(self, "_page", None)
         if page is not None and getattr(page, "on_item_double_clicked", None):
             if page.on_item_double_clicked(self.model_item):
@@ -161,6 +161,11 @@ class PathItem(QtWidgets.QGraphicsPathItem):
                 return
         if page is not None and self.model_item.text_spec:
             page.edit_text_item(self.model_item)
+            event.accept()
+            return
+        if page is not None and self.model_item.image_spec:
+            # 图片就地重追（FR-10/US-5）：有 image_spec 的图元双击即调参重出
+            page.retrace_image_item(self.model_item)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)

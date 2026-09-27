@@ -30,6 +30,7 @@ __all__ = [
     "MoveItemsCommand",
     "ChangeItemPropsCommand",
     "EditTextCommand",
+    "RetraceImageCommand",
     "ClearCommand",
     "GroupCommand",
     "UngroupCommand",
@@ -354,6 +355,47 @@ class EditTextCommand(_PageCommand):
     def _apply(self, paths, spec) -> None:
         self.item.paths = copy.deepcopy(paths)
         self.item.text_spec = copy.deepcopy(spec)
+        gi = self.page._gi_for(self.item)
+        if gi is not None:
+            gi.rebuild_path()  # 内含 prepareGeometryChange()
+        self.page._after_change()
+
+    def redo(self) -> None:
+        self._run(self._do_redo)
+
+    def _do_redo(self) -> None:
+        self._apply(self.new_paths, self.new_spec)
+
+    def undo(self) -> None:
+        self._run(self._do_undo)
+
+    def _do_undo(self) -> None:
+        self._apply(self.old_paths, self.old_spec)
+
+
+class RetraceImageCommand(_PageCommand):
+    """图片**就地重追**（FR-10/T10）：换新 paths + image_spec（FR-08 坑 2 同源）。
+
+    结构照 :class:`EditTextCommand`（old/new paths + spec）——**必须**走这条
+    显式 ``rebuild_path`` 通道：setattr 通道只应用 pos/scale/rotation，
+    换 ``paths`` 不重画的话画布纹丝不动（重追对用户等于没发生）。
+
+    **重追保持 pos / scale / angle_deg 不变**（FR-10 验收③）：只换几何与
+    spec，位置/缩放/角度一个字段都不碰 ⇒ 新线条出现在原位置、原缩放、原角度。
+    """
+
+    def __init__(self, page, item: Item, new_paths, new_spec: dict | None,
+                 text: str = "重追图片"):
+        super().__init__(page, text)
+        self.item = item
+        self.new_paths = new_paths
+        self.new_spec = new_spec
+        self.old_paths = copy.deepcopy(item.paths)
+        self.old_spec = copy.deepcopy(item.image_spec)
+
+    def _apply(self, paths, spec) -> None:
+        self.item.paths = copy.deepcopy(paths)
+        self.item.image_spec = copy.deepcopy(spec)
         gi = self.page._gi_for(self.item)
         if gi is not None:
             gi.rebuild_path()  # 内含 prepareGeometryChange()

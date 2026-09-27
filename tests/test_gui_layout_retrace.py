@@ -245,9 +245,18 @@ def test_retrace_requires_existing_source(tmp_path, monkeypatch):
     lp.deleteLater()
 
 
-def test_double_click_on_image_triggers_retrace(tmp_path):
-    """双击图片图元 → 走重追回调（不是文字重编）。"""
+def test_double_click_on_image_dispatches_to_retrace(tmp_path, monkeypatch):
+    """**真实**双击 → ``PathItem.mouseDoubleClickEvent`` 真的分派到重追。
+
+    上一版只断言 ``callable(page.retrace_image_item)``，删掉 ``items.py``
+    里的 image_spec 分支也照样绿 —— 那不算接线覆盖。本用例直接调
+    ``mouseDoubleClickEvent`` 并用替身记录分派目标。
+    """
     import megapro.gui.layout.layout_page as L
+    from megapro.gui.canvas.items import PathItem
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtCore import Qt
 
     lp = L.LayoutPage()
     src = _synthetic_png(tmp_path)
@@ -257,18 +266,106 @@ def test_double_click_on_image_triggers_retrace(tmp_path):
     it.image_spec = {"source": src, "mode": "canny", "low": 50, "high": 120,
                      "target_mm": 100.0, "threshold": 160, "multi": False}
     lp._add_items([it])
-    # 双击链：PathItem → page.retrace_image_item（此处因会弹对话框，只验回调存在）
-    assert callable(lp.retrace_image_item)
-    assert it.image_spec is not None
+    gi: PathItem = lp._gi_for(it)
+
+    called: list = []
+    monkeypatch.setattr(lp, "retrace_image_item", lambda item: called.append(item))
+    ev = QMouseEvent(QMouseEvent.Type.MouseButtonDblClick, QPointF(0, 0),
+                     Qt.MouseButton.LeftButton,
+                     Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    gi.mouseDoubleClickEvent(ev)
+    assert called == [it], "双击未分派到 retrace_image_item"
     lp.deleteLater()
+
+
+def test_double_click_text_item_still_goes_to_text_edit(tmp_path, monkeypatch):
+    """分派顺序：文字图元双击仍走**文字重编**（不被图片分支抢走）。"""
+    import megapro.gui.layout.layout_page as L
+    from megapro.gui.canvas.items import PathItem
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    lp = L.LayoutPage()
+    it = L._import_group([[[(0.0, 0.0), (5.0, 0.0)]]], name="文字")[0]
+    it.text_spec = {"text": "hi", "mode": "outline"}
+    it.image_spec = {"source": "x.png", "mode": "canny"}  # 两者都有
+    lp._add_items([it])
+    gi: PathItem = lp._gi_for(it)
+
+    text_calls: list = []
+    img_calls: list = []
+    monkeypatch.setattr(lp, "edit_text_item", lambda item: text_calls.append(item))
+    monkeypatch.setattr(lp, "retrace_image_item", lambda item: img_calls.append(item))
+    ev = QMouseEvent(QMouseEvent.Type.MouseButtonDblClick, QPointF(0, 0),
+                     Qt.MouseButton.LeftButton,
+                     Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    gi.mouseDoubleClickEvent(ev)
+    assert text_calls == [it] and img_calls == []
+    lp.deleteLater()
+
+
+def test_clipboard_roundtrip_preserves_image_spec(tmp_path):
+    """复制/粘贴/副本**保留** ``image_spec``（否则副本双击不能重追）。
+
+    ``_item_to_json`` 是显式字段白名单：漏了 ``image_spec`` 时，复制出来的
+    图片图元 ``image_spec=None`` ⇒ :meth:`retrace_image_item` 直接拒绝，
+    用户看不出原因。``text_spec`` 同在白名单里，本用例一并钉住两者。
+    """
+    import megapro.gui.layout.layout_page as L
+    from megapro.gui.layout.model import Item
+
+    it = Item(paths=[[(0.0, 0.0), (5.0, 0.0)]], name="图",
+               text_spec={"a": 1},
+               image_spec={"source": "x.png", "mode": "canny", "low": 50,
+                           "high": 120, "target_mm": 100.0})
+    d = L._item_to_json(it)
+    assert "image_spec" in d
+    back = L._item_from_json(d, dz=0.0, z=1.0)
+    assert back.image_spec == it.image_spec
+    assert back.text_spec == it.text_spec
+    # 深拷贝，不共享
+    back.image_spec["mode"] = "center"
+    assert it.image_spec["mode"] == "canny"
+
+
+def test_clipboard_accepts_legacy_payload_without_image_spec():
+    """旧剪贴板内容（无 ``image_spec`` 键）仍可粘贴，不炸。"""
+    import megapro.gui.layout.layout_page as L
+
+    legacy = {"paths": [[(0.0, 0.0), (1.0, 0.0)]], "pos": (0.0, 0.0),
+              "scale": 1.0, "angle_deg": 0.0, "name": "x", "z": 1,
+              "text_spec": None}
+    it = L._item_from_json(legacy, dz=0.0, z=1.0)
+    assert it.image_spec is None
+    assert it.name == "x" and len(it.paths) == 1
+
+
+def test_cloned_image_item_still_retraceable(tmp_path):
+    """「复制副本」出的图片图元仍带 spec（副本链走 _clone_item → _item_from_json）。"""
+    import megapro.gui.layout.layout_page as L
+    from megapro.gui.layout.model import Item
+
+    src = _synthetic_png(tmp_path)
+    it = Item(paths=[[(0.0, 0.0), (5.0, 0.0)]], name="图",
+               image_spec={"source": src, "mode": "canny"})
+    clone = L._clone_item(it, dz=5.0, z=1.0)
+    assert clone.image_spec == it.image_spec
+    assert clone.image_spec["source"] == src
+    assert clone.image_spec and clone.pos == (5.0, 5.0)
 
 
 def test_retrace_dialog_prefills_from_spec(tmp_path, monkeypatch):
     """重追对话框**预填** ``image_spec``（只改要改的那项，其余不丢）。
 
     US-5「双击图片调阈值重追」的前提：不预填的话用户每次都得把模式/最长边/
-    Canny 阈值重敲一遍。``QDialog.exec`` 被替换为「自动接受并在此时读控件
-    初值」，故断言语义是「控件初值取自 spec」。
+    Canny 阈值/多阈值重敲一遍。``QDialog.exec`` 被替换为「自动接受并在此刻
+    读控件初值」，故断言语义是**控件初值取自 spec**（而不是流程跑通）。
+
+    回归价值：把 ``_ask_image_params`` 的 ``spec = dict(spec or {})`` 与各处
+    ``spec.get(...)`` 改回占位 ``spec = {}``，本用例**必红**（其余用例照绿
+    —— 它们只看模型字段，不看控件初值）。
     """
     import megapro.gui.layout.layout_page as L
     from PySide6 import QtWidgets
@@ -278,14 +375,14 @@ def test_retrace_dialog_prefills_from_spec(tmp_path, monkeypatch):
     def fake_exec(self):
         for child in self.findChildren(QtWidgets.QComboBox):
             seen["mode"] = child.currentData()
-        spins = []
-        for child in self.findChildren(QtWidgets.QSpinBox):
-            spins.append(child.value())
-        seen["spins"] = spins
+        seen["spins"] = [c.value()
+                         for c in self.findChildren(QtWidgets.QSpinBox)]
         for child in self.findChildren(QtWidgets.QCheckBox):
             seen["multi"] = child.isChecked()
         for child in self.findChildren(QtWidgets.QDoubleSpinBox):
             seen["mm"] = child.value()
+        for child in self.findChildren(QtWidgets.QSlider):
+            seen["threshold"] = child.value()
         return QtWidgets.QDialog.Accepted
 
     monkeypatch.setattr(QtWidgets.QDialog, "exec", fake_exec)
@@ -300,8 +397,42 @@ def test_retrace_dialog_prefills_from_spec(tmp_path, monkeypatch):
                      "multi": True, "target_mm": 88.0, "low": 33, "high": 99}
     lp._add_items([it])
     lp.retrace_image_item(it)
-    assert seen["mode"] == "canny"                 # 模式预填
-    assert 33 in seen["spins"] and 99 in seen["spins"]  # Canny 阈值预填
-    assert seen["multi"] is True                    # 多阈值预填
-    assert seen["mm"] == pytest.approx(88.0, abs=1e-6)  # 最长边预填
+    assert seen["mode"] == "canny"                    # 模式
+    assert 33 in seen["spins"] and 99 in seen["spins"]   # Canny low/high
+    assert seen["multi"] is True                      # 多阈值
+    assert seen["mm"] == pytest.approx(88.0, abs=1e-6)   # 最长边
+    assert seen["threshold"] == 77                    # 暗度阈值
+    lp.deleteLater()
+
+
+def test_add_image_records_spec_and_keeps_all_paths(tmp_path, monkeypatch):
+    """``_add_image`` 入库即记 spec，且**全部折线**都在（FR-10 坑 1 的回归）。
+
+    文件对话框与参数对话框都被替换：只验「点确定」之后模型里剩下什么 ——
+    ``image_spec`` 是否记全、Canny 产出的多条折线是否一条不丢。
+    """
+    import megapro.gui.layout.layout_page as L
+    from PySide6 import QtWidgets
+
+    src = _synthetic_png(tmp_path)
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (src, "")))
+    # 参数对话框：canny / 阈值 160 / 不多阈值 / 100mm / low 50 / high 120
+    monkeypatch.setattr(
+        L.LayoutPage, "_ask_image_params",
+        lambda self, **kw: ("canny", 160, False, 100.0, 50, 120))
+    lp = L.LayoutPage()
+    lp._add_image()
+
+    assert len(lp.doc.items) == 1
+    it = lp.doc.items[0]
+    # 全部 Canny 折线都在一个 Item 里
+    assert len(it.paths) >= 2, "Canny 对多目标应产出多条折线，不能只留一条"
+    assert len(it.transformed_paths()) == len(it.paths)
+    # spec 记全：模式 + 阈值 + Canny low/high + target + 源路径
+    assert it.image_spec["mode"] == "canny"
+    assert it.image_spec["source"] == src
+    assert it.image_spec["threshold"] == 160
+    assert it.image_spec["low"] == 50 and it.image_spec["high"] == 120
+    assert it.image_spec["target_mm"] == pytest.approx(100.0, abs=1e-6)
     lp.deleteLater()

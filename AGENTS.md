@@ -109,7 +109,15 @@ PYTHONPATH=src python -m megapro.gui               # 上位机（PySide6，中�
     拍平导出（y-down 对合）+ `doc_import.py` 组导入 + `layout_page.py`
     工具/属性/命令编排）、`text_to_svg.py`（fontTools 轮廓字 + 单线
     `data/chinese_hershey_heiti.json`）、`image_to_svg.py`（Pillow 阈值 +
-    `bin/potrace.exe`）、`edge_to_svg.py`（骨架中心线）。
+    `bin/potrace.exe`）、`edge_to_svg.py`（骨架中心线 + Canny 照片/素描）。
+    **2026-09-27 模型树化后**：`Item` 增 `children`（容器=children 非空）/
+    `mirror_x`·`mirror_y`/`image_spec`；`Document` 持 `pages` + **当前页门面**
+    （`items`/`bed_w`/`add`/`items_visible`/`top_z`… 全部委托当前页，故
+    `export_svg.py` 零改动即按当前页导出）；组用**扁平场景 + 自管组框 overlay**
+    （`canvas/group_overlay.py`，**不引入 Qt 父子**）；镜像数学只在
+    `canvas/coords.py::mirror_scalar`（复用唯一翻转实现 `flip_y_scalar`）。
+    测试：`test_gui_layout*.py`（model/doc_import 冻结 + group/pages/retrace）、
+    `test_gui_mirror.py`、`test_gui_edge.py`（纯逻辑 + 独立 QApplication）。
   - **预览 ≡ 发送（构造性）**：`compile_job` 产出 `CompiledJob.lines`（唯一
     真源）→ 预览吃 `parse_lines(lines)` 的 `segments`，worker 发同一份
     `lines`；生成器 bug 会原样出现在预览并被 golden 拦下。工件原点是
@@ -177,7 +185,33 @@ The pen is **friction-fit, no spring**. 2026-09-23：预览与排版重构（蓝
 漏翻、拖动不回写、竖标尺恒偏、数值定位/吸附脱节）均已修复并有回归；详见
 `REPORT.md` 的 2026-09-23 重构记录。
 
-## 已知缺口 / 后续（2026-09-23，明确不做或待做）
+2026-09-27：**排版模型树化 PRD（`docs/PRD_layout_model_tree.md` v1.3）M1–M6
+全部落地**，全量 pytest **326 passed**（基线 217）。新增能力与落点：
+- **M1 树化地基**：`Item.children`（容器 = children 非空）、递归
+  `bbox`/`transformed_paths`/`page_bbox`/`flatten_visible`（父∘子一般式）、
+  `MAX_TREE_DEPTH=64` 成环保护、`Document.remove` 组感知 + `DetachInfo` 归属回执。
+- **M2 编组**：`Document.group_items`/`ungroup`、`Group/UngroupCommand`、
+  `canvas/group_overlay.py`（**扁平场景 + 自管组框 overlay，不引入 Qt 父子** ——
+  `pos()` 是唯一返回父坐标系的接口，成组即错位）；组选中 = 叶子集，
+  **组变换 = 叶子变换集合**、容器恒等；`_all_paths` 吸附候选切页面域
+  （拖动侧与绘制侧共用 `snap_candidate_paths` 一份）。
+- **M3 镜像**：`coords.mirror_scalar`（复用唯一翻转实现）、`Item.mirror_x/y`
+  （支点 = **本地 bbox 中心**、pos/scale/angle **不补偿**）、合成顺序
+  mirror→scale→rotate→translate、`rebuild_path` 烘镜像 + `ChangeItemPropsCommand`
+  按 `_GEOMETRY_FIELDS` 额外重建（setattr 通道带不了几何）。
+- **M4 多页**：`Document.pages` + **当前页门面**（`items`/`bed_w`/`add`/… 全委托）
+  ⇒ `export_svg.py` **零改动**即按当前页导出；页签 UI + 场景全量重建；
+  撤销 = **单栈 + 命令页归属**（跨页撤销作用到归属页再还原视图页）。
+- **M5 图片重追**：`Item.image_spec`、`RetraceImageCommand`（显式
+  `rebuild_path`）、加图对话框「照片/素描（Canny+骨架）」模式 + 双击就地重追
+  （参数预填、pos/scale/angle 不变、可撤销）。
+- 新增用例：`tests/test_gui_layout_group.py`（19）、`test_gui_mirror.py`（20）、
+  `test_gui_layout_pages.py`（18）、`test_gui_layout_retrace.py`（18）、
+  `test_gui_edge.py` 的 Canny golden（12，含上游 T11）。既有冻结面
+  （`test_gui_layout.py` 37 / `test_gui_doc_import.py` 10 /
+  `test_gui_layout_window.py` 21 / `test_coords.py` 12）**一字未改全绿**。
+
+## 已知缺口 / 后续（2026-09-27 更新；明确不做或待做）
 
 - **执行期 M114 轮询**：run_job 期间 LiveMarker 冻结置灰（无位置回报）——
   要做得改 worker `run_job` 发送/暂停/中止流控（零改动红线），明确不做；
@@ -188,6 +222,17 @@ The pen is **friction-fit, no spring**. 2026-09-23：预览与排版重构（蓝
   段数 >2000 实测需要才做。
 - SVG 单位换算（px/in、viewBox 缩放）、越界自动裁剪（只拦截+报告）、
   橡皮筋/凸包 Frame、Word/Excel 样式保真 —— 均按蓝图 §9 明确不做。
+- **跨页批量逐页导出**：与 `PRD_layout.md` §5 决策 5「单 SVG」冲突，按当前页
+  导出保契约。
+- **越界预检只警告不拦截**（`layout_page._on_export`）：超出 210×210 弹提示后
+  仍无条件 `export_requested.emit`。本轮未改其行为，只把它检查的 bbox 精度改好
+  （改走 `iter_units` + `unit_page_bbox`，含祖先链）。
+- **页操作不可撤销**：增/删/复制/重排页不进撤销栈（PRD 未要求）。故栈里旧命令的
+  归属页可能变陈旧 —— 越界已被 `_PageCommand._run` 兜住（就地降级不抛），范围内
+  错页时撤销静默失效。
+- **组的镜像语义未定义**（PRD FR-08 只定义 Item 级）：当前是**逐成员**各绕自身
+  中心翻，不是整组刚性反射。若产品要后者需另立契约（组级镜像字段或成员 paths
+  绕组中心重写），两者都会突破 v1.3「不补偿/仅标志」裁决。
 - 契约曾列「拖动的对象吸附（端点/中点/边）」「吸附 pitch 联动 grid_steps
   minor」「数值输入撤销合并（手势 token）」为缺口；**本树已实现**并有回归
   （`tests/test_gui_layout_window.py::test_drag_snaps_to_object_key_points`、

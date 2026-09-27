@@ -92,7 +92,7 @@ G0 Z40 F600 / G0 Y50 F600 / G0 Z-16 F600 / G0 X10 F600 / G0 Z10 F600
 
 ## 8. 测试
 
-`python -m pytest -q`：33 项（传输/安全 7、工具链 6、transform 回归 2、CLI 回归 9、相机 2、端到端集成 2、settle 3），全绿。集成测试用本机 TCP 模拟 Marlin 跑探测建档到文件发送全链。
+`PYTHONPATH=src python -m pytest -q`：2026-09-27 收口实跑 **326 项全绿**（18.61s；基线 217）。集成测试用本机 TCP 模拟 Marlin 跑探测建档到文件发送全链。GUI 测试自设 `QT_QPA_PLATFORM=offscreen` 且每文件独占一个 QApplication。最新一次全量实跑的分组明细见下方「11.4 验证结果」。
 
 ## 9. 下一步建议
 
@@ -204,3 +204,71 @@ TiledPathItem（>2000 段实测需要才做）、SVG 单位换算/越界自动�
 Frame/Word·Excel 样式保真（蓝图 §9 明确不做）；真机验收清单（Frame 目视、
 设原点对准 <1mm、空跑不触纸）待现场执行。契约曾列的「拖动对象吸附/吸附
 pitch 联动/数值输入撤销合并」本树已实现（见 10.1 #10 回归列），不列缺口。
+
+---
+
+# 2026-09-27 重构记录（排版模型树化，PRD v1.3 M1–M6 全部落地）
+
+契约：`docs/PRD_layout_model_tree.md`（v1.3）。基线 217 → 收口 **326 passed**
+（全量实跑，`PYTHONPATH=src python -m pytest -q --basetemp=.pytest_tmp
+-p no:cacheprovider`）。串口链（`safety/`/`transport/`/`dialect/`）、`worker.py`
+流控、`main_window._recompile` 触发语义、`export_svg.py`、`coords.py` 的既有
+函数——**全程零改动**（`git diff` 逐路径核验为空）。
+
+## 11.1 里程碑 → 落地形态
+
+| 里程碑 | 内容 | 关键落点 |
+|---|---|---|
+| M1 | 树化地基 | `Item.children`、`MAX_TREE_DEPTH=64`、`remove` 组感知 + `DetachInfo` |
+| M2 | 编组 | `group_items`/`ungroup`、`Group/UngroupCommand`、`canvas/group_overlay.py` |
+| M3 | 镜像 | `coords.mirror_scalar`、`Item.mirror_x/y`、`rebuild_path` 烘镜像 |
+| M4 | 多页 | `Document.pages` + 当前页门面、页签 UI、单栈+命令页归属 |
+| M5 | 图片重追 | `Item.image_spec`、`RetraceImageCommand`、Canny 模式接线 |
+| M6 | 收口 | 全量回归 + 文档状态注记（本节） |
+
+## 11.2 与 PRD 设想不同、值得记的六处
+
+1. **编组不用 QGraphicsItem 父子**：蓝图 `:149` 明说 `pos()` 是唯一返回父坐标
+   系的接口，成组即错位。改用「模型树 + 扁平场景 + 自管组框 overlay」。
+2. **组变换 = 叶子变换集合**，容器恒为恒等变换（无渲染通路）；组选中 = 叶子集，
+   故「拖组 = 一条命令」复用既有 `commit_move` 漂移收集，零新增代码。
+3. **镜像支点 = 本地 bbox 中心**（一般式），`pos`/`scale`/`angle` 不补偿；
+   组的镜像是**逐成员**翻，不是整组刚性反射（PRD 未定义组的镜像语义）。
+4. **多页用当前页门面**而非改造所有消费点：`items`/`bed_w`/… 委托当前页，故
+   `export_svg.py` 零改动即按当前页导出——这是「零改动声明」成立的前提。
+5. **撤销是单栈 + 命令页归属**，不是每页独立栈：Ctrl+Z 的心智是「时间上的上
+   一步」；跨页撤销自动作用到归属页再还原视图页。
+6. **吸附候选域修复是 FR-06 的前置**：`_all_paths` 原返回**局部**坐标而吸附喂入
+   的是页面坐标（域不一致，`pos≠(0,0)` 的图元对象吸附恒零命中）；现拖动侧与绘制
+   侧共用 `snap_candidate_paths` 一份页面域实现。
+
+## 11.3 收口时修的跨里程碑缺口
+
+- **`image_spec` 不在剪贴板白名单**（M2 的 `_item_to_json`/`_item_from_json` 显式
+  字段表漏了它）⇒ 复制/粘贴/副本得到的图片图元 `image_spec=None`，**双击不再能
+  重追**且无任何报错。已补入两处并加 3 条用例（含旧剪贴板兼容）。
+- **收口期自身的覆盖回退（评审拦下）**：重写双击用例时，脚本按「从旧用例处截断
+  再拼接」把其后的 `test_retrace_dialog_prefills_from_spec` 一并删掉，且自述未
+  提及 —— 实测把预填改回占位后全量仍全绿。即「对话框按 spec 预填」这条 US-5
+  能力一度**无回归保护**，而两份文档已把它当已交付能力对外声明。已原样恢复并
+  加验：撤掉预填 ⇒ 仅该用例变红。教训：**重写测试文件时不要用「从某处截断再拼接」
+  的脚本**，否则尾部用例会被静默吃掉（本条与下条同源）。
+
+## 11.4 验证结果（2026-09-27，M6 实跑）
+
+- 全量 `pytest -q` → **326 passed in 18.61s**（基线 217）。
+- `tests/test_coords.py` 12 条全绿：翻转写法全树扫描、符号级扫描（禁 `flip_y`/
+  `already_paper`）、210 常量单源、210 收敛扫描——镜像数学全落
+  `coords.mirror_scalar`（复用唯一翻转实现），零手写翻转。
+- 既有冻结面一字未改仍绿：`test_gui_layout.py` 37、`test_gui_doc_import.py` 10、
+  `test_gui_layout_window.py` 21。
+- 新增用例：组 19 / 镜像 20 / 多页 18 / 重追 18 / Canny golden 12（含上游 T11）。
+- 关键用例经「撤掉实现→必须变红」验证（分布去重、镜像逐轴门控、跨页撤销归属、
+  剪贴板 image_spec、重追对话框预填、setattr 通道重建路径）。
+
+## 11.5 已知缺口（同 AGENTS.md「已知缺口/后续」）
+
+新增记入：越界预检**只警告不拦截**（`_on_export` 弹提示后仍无条件 emit，本轮只
+改善了它所查 bbox 的精度）；**页操作不可撤销**（栈里旧命令的归属页可能陈旧，越界
+已兜住、范围内错页时撤销静默失效）；**组的镜像语义未定义**。其余沿用 10.4。
+真机验收（贴纸镜像的翻面转印效果、Canny 真实照片调参）**需现场**。

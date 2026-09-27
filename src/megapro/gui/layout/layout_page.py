@@ -177,8 +177,8 @@ def _union_bbox(boxes) -> tuple[float, float, float, float]:
 def _item_to_json(item: Item) -> dict:
     d = {"paths": item.paths, "pos": item.pos, "scale": item.scale,
          "angle_deg": item.angle_deg, "name": item.name, "z": item.z,
-         "text_spec": item.text_spec, "visible": item.visible,
-         "locked": item.locked}
+         "text_spec": item.text_spec, "image_spec": item.image_spec,
+         "visible": item.visible, "locked": item.locked}
     if item.children:
         d["children"] = [_item_to_json(ch) for ch in item.children]
     return d
@@ -205,6 +205,7 @@ def _item_from_json(d: dict, *, dz: float, z: float) -> Item:
         visible=bool(d.get("visible", True)),
         locked=bool(d.get("locked", False)),
         text_spec=copy.deepcopy(d.get("text_spec")),
+        image_spec=copy.deepcopy(d.get("image_spec")),
         children=kids,
     )
 

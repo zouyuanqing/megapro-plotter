@@ -18,6 +18,7 @@ __all__ = [
     "BED_W",
     "BED_H",
     "flip_y_scalar",
+    "mirror_scalar",
     "paper_to_svg_ydown",
     "paper_from_svg_ydown",
     "machine_from_paper",
@@ -50,6 +51,24 @@ def flip_y_scalar(y: float, span: float) -> float:
     与归一化域格式编码调用；其他任何地方不得手写翻转。
     """
     return span - y
+
+
+def mirror_scalar(v: float, lo: float, hi: float) -> float:
+    """区间 ``[lo, hi]`` 内的镜像（对合）：把 ``v`` 映到关于区间中点的对称点。
+
+    复用唯一翻转实现 :func:`flip_y_scalar`（D3：镜像数学必须落本文件）::
+
+        v' = flip_y_scalar(v - lo, hi - lo) + lo
+           = (hi - lo) - (v - lo) + lo = hi - v
+
+    减 ``lo`` 再加回是为了写成**任意区间**的形式（而非「0 起点」专用）——
+    FR-08 v1.3 定稿：镜像支点 = **本地 bbox 中心**（一般式），不依赖
+    ``normalize_local`` 的 ``y0 == 0`` 不变量（它只在创建/导入入口调用，
+    直接构造的 Item 同样要正确）。``lo == 0`` 时退化为 ``flip_y_scalar(v, hi)``。
+
+    水平/垂直同式：把 v 换成对应分量、区间换成对应轴的 bbox 跨度即可。
+    """
+    return flip_y_scalar(v - lo, hi - lo) + lo
 
 
 def paper_to_svg_ydown(paths: Path2D, bed_h: float = BED_H) -> Path2D:

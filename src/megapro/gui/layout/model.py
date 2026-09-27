@@ -46,6 +46,26 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
     （全树身份查找），**不是**「是否在顶层列表」。
 
   组变换只写叶子集合（FR-04/FR-05），容器变换恒为恒等。
+- **镜像（FR-08）**：`mirror_x``/``mirror_y`` 布尔，**支点 = 本地 bbox 中心**
+  （一般式，v1.3 定稿，**不依赖** ``normalize_local`` 的 ``y0==0`` 不变量 ——
+  它只在创建/导入入口调用，直接构造的 Item 同样要正确），``pos``/``scale``/
+  ``angle_deg`` **不补偿**（原位镜像 ⇒ bbox 稳定、位置不动）。合成顺序
+  **mirror → scale → rotate → translate**（:func:`_apply_transform` 首个分支）。
+  镜像数学只在 :func:`coords.mirror_scalar`（复用唯一翻转实现
+  :func:`coords.flip_y_scalar`），**本文件不写任何翻转算术**
+  （``tests/test_coords.py`` 全树扫描口径）。未设镜像时数学**逐位**不变。
+  - **退化跨度必须逐轴挡**（该轴宽/高为 0，如竖直线的水平镜像）= **该轴**无
+    镜像轴 ⇒ 该轴不镜像（:func:`_axis_mirrors`）；不挡的话 ``mirror_scalar(v,v,v)``
+    会退化成绕原点反射、把图形搬到负半轴。**一轴退化绝不得牵连另一轴** ——
+    曾用单个 ``None`` 门控整项，导致「竖直线 + 水平&垂直双标志」时 y 的镜像被
+    连带静默丢弃（flag=True 而几何未镜像，且随导出/JobSpec 一路传下去）；
+    触发路径是常规操作（工具条两个独立按钮连点）。:func:`_mirror_span` 现只在
+    **两标志皆未置位**时返回 None。
+  - 画布侧：镜像**必须**烘进画笔路径（:meth:`Item.local_paths` →
+    ``PathItem.rebuild_path``），因为 ``apply_model_state`` 只应用
+    pos/scale/rotation、**不重建** QPainterPath ⇒ 只改标志画布纹丝不动。
+    setattr 通道（``ChangeItemPropsCommand``）据此按 ``_GEOMETRY_FIELDS``
+    额外 ``rebuild_path()``。
 - **删除/复原的归属契约**：:meth:`Document.remove` **组感知**（按身份定位 owning
   container 并从其 children 摘除）并返回 :class:`DetachInfo`（原容器 + 原下标），
   :meth:`Document.attach` 为其逆。**两者必须成对使用**：只组感知而不把归属信息
@@ -88,7 +108,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from megapro.gui.canvas.coords import BED_H, BED_W
+from megapro.gui.canvas.coords import BED_H, BED_W, mirror_scalar
 
 __all__ = [
     "BED_W",
@@ -125,20 +145,74 @@ def _check_depth(depth: int) -> None:
             "自身子集，或移动/删除时产生了环）")
 
 
-def _apply_transform(item: Item, path: Polyline) -> Polyline:
-    """一条折线过 ``item`` 的变换：本地 → 缩放 → 旋转(绕 pos) → 平移 pos。
+def _mirror_span(item: Item) -> tuple[float, float, float, float] | None:
+    """镜像支点跨度 = ``item`` 的**本地 bbox**（FR-08 v1.3：支点=中心，一般式）。
+
+    不依赖 ``normalize_local`` 的 ``y0 == 0`` 不变量（它只在创建/导入入口调用，
+    直接构造的 Item 同样正确）。
+
+    只在**两个标志都未置位**时返回 None（整项免镜像的快路径）；置位时**一律
+    返回 bbox**，退化与否由**每个轴各自**判定（:func:`_axis_mirrors`）：
+
+    **退化跨度必须逐轴挡，不能整项挡**。一条竖直线（``x0 == x1``）没有水平
+    镜像轴，但若同时置了 ``mirror_y``，它的垂直镜像**依然要生效** ——
+    整项返回 None 会把 y 的镜像连带静默丢弃，造成「flag=True 而几何未镜像」
+    的分叉，并随导出/JobSpec 一路传下去。触发路径是常规操作：工具条是两个
+    独立按钮，连点「水平镜像 + 垂直镜像」即触发。
+    """
+    if not (item.mirror_x or item.mirror_y):
+        return None
+    return item.bbox()
+
+
+def _axis_mirrors(item: Item, span: tuple | None) -> tuple[bool, bool]:
+    """该图元**每轴**是否真正镜像 = ``(mirror_x 生效, mirror_y 生效)``。
+
+    逐轴判据（FR-08 v1.3：退化跨度 = **该轴**无镜像轴 ⇒ 该轴不镜像）：
+    ``mirror_x and x1 > x0`` / ``mirror_y and y1 > y0``。
+
+    退化轴不镜像的原因：``mirror_scalar(v, v, v)`` 会退化成**绕原点反射**
+    （``-v``），把图形搬到负半轴；而不镜像才是对的 —— 竖直线的水平镜像、
+    水平线的垂直镜像本就是恒等。
+    """
+    if span is None:
+        return (False, False)
+    x0, y0, x1, y1 = span
+    return (bool(item.mirror_x and x1 > x0), bool(item.mirror_y and y1 > y0))
+
+
+def _apply_transform(item: Item, path: Polyline,
+                     *, span: tuple | None = None) -> Polyline:
+    """一条折线过 ``item`` 的变换：
+    **镜像 → 缩放 → 旋转(绕 pos) → 平移 pos**（FR-08 合成顺序）。
 
     **合成数学的唯一实现**（FR-01 父∘子）：叶子取自身变换、容器按祖先链
     由内到外逐层套用，两条路径共用本函数，故 ``Item.transformed_paths`` 与
     ``flatten_visible`` 永不各写一套（导出/预览/送作业三链同源）。
+
+    镜像数学在 :func:`coords.mirror_scalar`（复用唯一翻转实现），**本文件不写
+    任何翻转算术**（``tests/test_coords.py`` 全树扫描口径）。未设镜像时
+    ``mirror_x/mirror_y`` 皆 False ⇒ 本函数**逐位**走原数学（既有 golden 不变）。
+
+    ``span`` = 镜像支点跨度，由调用方**每 item 算一次**传入 —— 否则每条折线
+    都重算一次 ``bbox()``，千段图元退化成 O(n²)。
     """
     px, py = item.pos
     s = item.scale
     rad = math.radians(item.angle_deg)
     cos, sin = math.cos(rad), math.sin(rad)
+    if span is None:
+        span = _mirror_span(item)
+    # 逐轴判定：退化轴不镜像，另一轴照常（M2/M3 评审修正：不得整项门控）
+    mirror_x, mirror_y = _axis_mirrors(item, span)
+    x_lo, y_lo, x_hi, y_hi = span if span is not None else (0.0, 0.0, 0.0, 0.0)
     pts = []
     for x, y in path:
-        # 本地(可能带缩放前) → 缩放 → 旋转(绕 pos) → 平移
+        # 本地 → 镜像(绕本地 bbox 中心) → 缩放 → 旋转(绕 pos) → 平移
+        if mirror_x:
+            x = mirror_scalar(x, x_lo, x_hi)
+        if mirror_y:
+            y = mirror_scalar(y, y_lo, y_hi)
         x1, y1 = x * s, y * s
         rx = x1 * cos - y1 * sin + px
         ry = x1 * sin + y1 * cos + py
@@ -175,6 +249,12 @@ class Item:
     visible: bool = True  # 隐藏则导出/显示都跳过（含整棵子树）
     text_spec: dict | None = None  # 文字源信息（可重编）：见 text_to_svg
     children: list["Item"] = field(default_factory=list)  # 非空即容器
+    # 镜像（FR-08）：支点 = **本地 bbox 中心**（一般式，v1.3 定稿），
+    # pos/scale/angle **不补偿**（原位镜像：内容绕自身中心像点翻转，仅标志
+    # 变更 ⇒ bbox 稳定、页面位置不变）。数学在 coords.mirror_scalar（复用唯一
+    # 翻转实现 flip_y_scalar），本文件不写任何翻转算术。
+    mirror_x: bool = False
+    mirror_y: bool = False
 
     def is_container(self) -> bool:
         """容器 = ``children`` 非空（FR-01 术语）。
@@ -212,9 +292,10 @@ class Item:
         （:func:`iter_flattens` 携祖先链），二者不得各写一套。
         """
         _check_depth(_depth)
-        out = [_apply_transform(self, p) for p in self.paths]
+        span = _mirror_span(self)
+        out = [_apply_transform(self, p, span=span) for p in self.paths]
         for ch in self.children:
-            out.extend(_apply_transform(self, p)
+            out.extend(_apply_transform(self, p, span=span)
                        for p in ch.transformed_paths(_depth=_depth + 1))
         return out
 
@@ -238,6 +319,34 @@ class Item:
         if not xs:
             return (0.0, 0.0, 0.0, 0.0)
         return (min(xs), min(ys), max(xs), max(ys))
+
+    def local_paths(self) -> list[Polyline]:
+        """**本地**折线（含镜像、不含 scale/rotate/translate）—— 画布绘制用。
+
+        :meth:`transformed_paths` 拍平了**全部**变换（镜像→缩放→旋转→平移），
+        而 :class:`~megapro.gui.canvas.items.PathItem` 的场景变换由 Qt 承担
+        （``setPos``/``setScale``/``setRotation``，支点 = 本地 (0,0)），故它
+        需要的是「只烘了镜像」的本地坐标。
+
+        FR-08：镜像**必须**烘进画笔路径 —— 只改 ``mirror_x/mirror_y`` 标志而
+        不重画，场景上什么都不会变（``apply_model_state`` 只应用
+        pos/scale/rotation，见 ``canvas/items.py``）。镜像绕**本地 bbox 中心**，
+        故 ``boundingRect`` 稳定。
+
+        未设镜像时**逐位等于** ``item.paths``。两轴**各自**判退化
+        （:func:`_axis_mirrors`）—— 一轴退化不得牵连另一轴。
+        """
+        span = _mirror_span(self)
+        mirror_x, mirror_y = _axis_mirrors(self, span)
+        if not (mirror_x or mirror_y):
+            return [list(p) for p in self.paths]
+        x_lo, y_lo, x_hi, y_hi = span
+        out: list[Polyline] = []
+        for poly in self.paths:
+            out.append([(mirror_scalar(x, x_lo, x_hi) if mirror_x else x,
+                        mirror_scalar(y, y_lo, y_hi) if mirror_y else y)
+                       for x, y in poly])
+        return out
 
     def unit_page_bbox(self,
                        chain: tuple["Item", ...] = ()) -> tuple[float, float, float, float]:
@@ -536,9 +645,10 @@ def unit_paths(item: Item, chain: tuple["Item", ...] = ()) -> list[Polyline]:
     overlay 都改走本函数而非裸 ``item.transformed_paths()``/``page_bbox()``：
     后两者不含祖先链（M1 缺口 #1），编组后对组内叶子会给出局部坐标。
     """
-    paths = item.transformed_paths()
+    paths = item.transformed_paths()  # 自身变换已含镜像
     for anc in reversed(chain):  # 由内到外：父∘子
-        paths = [_apply_transform(anc, p) for p in paths]
+        anc_span = _mirror_span(anc)
+        paths = [_apply_transform(anc, p, span=anc_span) for p in paths]
     return paths
 
 
@@ -578,7 +688,8 @@ def iter_flattens(items: list[Item], *, visible_only: bool = True):
         for it in seq:
             if visible_only and not it.visible:
                 continue
-            yield it, [_apply_transform(it, p) for p in it.paths], chain
+            span = _mirror_span(it)  # 每 item 一次，不每折线
+            yield it, [_apply_transform(it, p, span=span) for p in it.paths], chain
             if it.children:
                 yield from _walk(it.children, chain + (it,), depth + 1)
 
@@ -672,7 +783,8 @@ def flatten_visible(doc: Document) -> list[Polyline]:
     out: list[Polyline] = []
     for _it, paths, chain in units:
         for anc in reversed(chain):  # 由内到外：父∘子
-            paths = [_apply_transform(anc, p) for p in paths]
+            anc_span = _mirror_span(anc)
+            paths = [_apply_transform(anc, p, span=anc_span) for p in paths]
         for p in paths:
             if len(p) >= 2:
                 out.append(p)

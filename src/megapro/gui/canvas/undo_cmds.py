@@ -38,6 +38,15 @@ __all__ = [
 #: 手势 token 序号（press→release 一个 token；同时充当 mergeWith 的 id）
 _GESTURE_SEQ = count(1)
 
+#: **改变画笔几何**的字段（FR-08）：走 setattr 通道时必须额外
+#: ``gi.rebuild_path()``，否则场景不更新（``_sync_gi`` → ``apply_model_state``
+#: 只应用 pos/scale/rotation，不重建 QPainterPath）。
+#: - ``mirror_x``/``mirror_y``：镜像烘在**画笔路径**里（绕本地 bbox 中心）。
+#: - ``paths``：直接换折线集合（同 :class:`EditTextCommand` 的场景）。
+#: pos/scale/angle_deg **不在**此列 —— 它们由 Qt 场景变换承担，``_sync_gi``
+#: 已正确应用。
+_GEOMETRY_FIELDS = frozenset({"mirror_x", "mirror_y", "paths"})
+
 
 def new_gesture_token() -> int:
     """发新手势 token（press→release 一个 token）。
@@ -239,6 +248,14 @@ class ChangeItemPropsCommand(_PageCommand):
             for k, v in d.items():
                 setattr(it, k, v)
             self.page._sync_gi(it)
+            # **几何字段必须显式重建画笔路径**（FR-08）：``_sync_gi`` →
+            # ``apply_model_state`` 只应用 pos/scale/rotation，**不重建路径**。
+            # 只 setattr 镜像标志而画布纹丝不动 ⇒ 用户点了「水平镜像」没反应。
+            # 与 :class:`EditTextCommand` 同一类问题的同一修法。
+            if set(d) & _GEOMETRY_FIELDS:
+                gi = self.page._gi_for(it)
+                if gi is not None:
+                    gi.rebuild_path()  # 内含 prepareGeometryChange()
         self.page._after_change()
 
     def redo(self) -> None:

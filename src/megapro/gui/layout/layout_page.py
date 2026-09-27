@@ -561,6 +561,11 @@ class LayoutPage(QtWidgets.QWidget):
             b.setAutoRaise(True)
             tb.addWidget(b)
         tb.addSeparator()
+        # 镜像（FR-08，贴纸转印）
+        for label, fn in (("水平镜像", lambda: self._toggle_mirror("h")),
+                          ("垂直镜像", lambda: self._toggle_mirror("v"))):
+            add_btn(label, fn)
+        tb.addSeparator()
         # 编组/解组（FR-03）
         for label, fn in (("编组", self.group_selected),
                           ("解组", self.ungroup_selected)):
@@ -934,6 +939,36 @@ class LayoutPage(QtWidgets.QWidget):
             top_z = max(top_z, items[-1].z)
         if items:
             self._undo.push(AddItemsCommand(self, items, "复制副本"))
+
+    # -- 镜像（FR-08） -----------------------------------------------------
+
+    def _toggle_mirror(self, axis: str) -> None:
+        """切换选中图元的水平/垂直镜像（FR-08，可撤销）。
+
+        走 :class:`ChangeItemPropsCommand`（镜像标志属其 setattr 通道），该
+        命令已按 ``_GEOMETRY_FIELDS`` 额外 ``rebuild_path()`` ⇒ 画布立即重画。
+        镜像**绕本地 bbox 中心**、``pos``/``scale``/``angle`` 不补偿 ⇒ 页面
+        位置与 bbox 稳定，只内容左右/上下翻转（贴纸转印：刻完翻面字是正的）。
+
+        多选时取**全部选中项当前值的反值**中的一致方向：全 False → 置 True，
+        全 True → 置 False，混合 → 置 True（收敛到统一，便于再点一次归零）。
+        """
+        field = "mirror_x" if axis == "h" else "mirror_y"
+        sel = self._selected()
+        if not sel:
+            return
+        cur = [getattr(gi.model_item, field) for gi in sel]
+        new = not all(cur)
+        changes = [
+            (gi.model_item, {field: getattr(gi.model_item, field)},
+             {field: new})
+            for gi in sel
+            if getattr(gi.model_item, field) != new
+        ]
+        if changes:
+            self._undo.push(ChangeItemPropsCommand(
+                self, changes, "水平镜像" if axis == "h" else "垂直镜像"))
+        self._after_change()
 
     # -- 层序 / 对齐 / 分布 -------------------------------------------------
 

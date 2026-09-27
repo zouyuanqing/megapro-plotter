@@ -69,10 +69,16 @@ class PathItem(QtWidgets.QGraphicsPathItem):
         return p
 
     def rebuild_path(self) -> None:
-        """model.paths → 单条 QPainterPath（直画 y-up 本地坐标）。"""
+        """model.paths → 单条 QPainterPath（直画 y-up 本地坐标）。
+
+        用 :meth:`Item.local_paths` 而非 ``item.paths``：FR-08 要求**镜像烘进
+        画笔路径**（镜像绕本地 bbox 中心 ⇒ ``boundingRect`` 稳定）。场景的
+        scale/rotate/pos 仍由 Qt 承担（见 :meth:`apply_model_state`），故这里
+        只取本地系。未设镜像时 ``local_paths()`` 逐位等于 ``item.paths``。
+        """
         self.prepareGeometryChange()
         path = QtGui.QPainterPath()
-        for poly in self.model_item.paths:
+        for poly in self.model_item.local_paths():
             if not poly:
                 continue
             path.moveTo(QtCore.QPointF(float(poly[0][0]), float(poly[0][1])))

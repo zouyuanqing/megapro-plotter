@@ -274,6 +274,35 @@ def test_out_of_bed_dialog_reports_amount_and_not_hardcoded(msgbox):
     assert "big" in body
 
 
+def test_dialog_bed_size_text_follows_bed_constants(msgbox, monkeypatch):
+    """把 ``BED_W``/``BED_H`` 换成哨兵值 ⇒ 文案里的床面尺寸必须**跟着变**。
+
+    为什么上面那条 ``test_out_of_bed_dialog_reports_amount_and_not_hardcoded``
+    里的 ``assert f"{BED_W:g}" in body`` 单独看**证不了「没硬编码」**：本项目
+    ``BED_W`` 就是 210.0，硬写一个 ``"210"`` 同样让该断言通过 —— 断言的是一个
+    恒等于常量的字符串，对「有没有硬编码」零信息量。
+
+    这条用**构造性**办法补上：常量一改，文案必须跟着改。硬编码 210 的实现
+    在哨兵值下会显示 210 而不是 123/456 ⇒ 本条即红。
+    """
+    import megapro.gui.layout.layout_page as lp_mod
+
+    lp = _out_of_bed_page()          # x 20..230
+    got = _collect(lp)
+    monkeypatch.setattr(lp_mod, "BED_W", 123.0)
+    monkeypatch.setattr(lp_mod, "BED_H", 456.0)
+    msgbox.click = "取消"
+    lp._on_export()
+
+    assert len(msgbox.instances) == 1, "哨兵床面下 230>123 应判越界"
+    body = msgbox.instances[0].body
+    assert "123" in body, f"床面宽未跟随 BED_W 常量（疑似硬编码）：{body!r}"
+    assert "456" in body, f"床面高未跟随 BED_H 常量（疑似硬编码）：{body!r}"
+    # 越界量也必须跟着重算：230 − 123 = 107.0
+    assert "107.0" in body, f"越界量未按哨兵床面重算：{body!r}"
+    assert got == []
+
+
 def test_exec_return_is_role_value_not_dialog_code(msgbox):
     """钉住「判据只能用 ``clickedButton()``」这个前提。
 

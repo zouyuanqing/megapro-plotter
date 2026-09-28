@@ -428,6 +428,11 @@ class LayoutPage(QtWidgets.QWidget):
 
         返回 True 表示已消费（不再走文字重编）。顶层图元/组编辑态内的子项
         返回 False，由 :class:`PathItem` 继续走文字重编等既有回调。
+
+        **第 1 次双击被「进组」消费时必须出声**（C3）：组内图片的用户预期是
+        「双击→调参重追」，而实际第 1 次只进组、:meth:`_trace_image` 一次都没被
+        调用，得连双两次才知道能调参 —— 界面无提示时这就是「静默吞掉操作」。
+        故进组后按是否图片给中文提示，图片那条直接说明「再双击一次」。
         """
         if self._group_overlay.editing is not None:
             return False
@@ -435,6 +440,11 @@ class LayoutPage(QtWidgets.QWidget):
         if owner is None:
             return False
         self._enter_group_edit(item)
+        if getattr(item, "image_spec", None) is not None:
+            self.status_message.emit(
+                "已进入组编辑（双击进组）：再双击一次这张图片即可重追调参")
+        else:
+            self.status_message.emit("已进入组编辑：现在可选组内子项")
         return True
 
     def _exit_group_edit(self) -> None:
@@ -795,7 +805,13 @@ class LayoutPage(QtWidgets.QWidget):
             b = add_btn(label,
                         lambda _checked=False, a=axis: self._toggle_mirror(a),
                         checkable=True)
-            b.setToolTip(f"{label}（勾选 = 当前选中项处于该镜像态）")
+            b.setToolTip(
+                f"{label}（勾选 = 当前选中项处于该镜像态）\n"
+                "原位镜像：绕图元自身中心翻转，位置/角度不变。\n"
+                "多选时是逐个成员各绕自身中心分别镜像，"
+                "不是把整组作刚性反射。\n"
+                "旋转件的宽/高（轴对齐包围盒）会随之变化，"
+                "但图形本身大小不变。")
             self.btn_mirror[axis] = b
         tb.addSeparator()
         # 编组/解组（FR-03）
@@ -835,6 +851,23 @@ class LayoutPage(QtWidgets.QWidget):
             setattr(self, {"X": "sp_x", "Y": "sp_y", "宽": "sp_w", "高": "sp_h",
                            "角度°": "sp_ang"}[name], sp)
             props.addWidget(sp)
+        # 宽/高 的口径必须写在界面上（C3）：它是**纸面轴对齐包围盒(AABB)**的
+        # 宽高，不是图形边长。旋转件镜像后数字会跳（如 W 5.70→8.48），而画布上
+        # 图形边长与面积**完全没变** —— 那是「原位镜像」的定义（PRD v1.3 裁决
+        # 的「不补偿」），不是 bug；不说清楚用户会以为程序出错。
+        # ⚠ 更要紧的是：:meth:`_apply_size` 的缩放基线就是这个 AABB
+        # （``k = 输入值 / 当前 AABB``），数字跳了之后**用户改宽高会跟着变**，
+        # 所以提示必须落在宽/高这两个框上，而不是只写在别处。
+        # ⚠ tooltip 是 Qt 富文本，**不会**渲染 markdown 里的 ``**`` ——
+        # 写了会在用户面前显示成字面星号。面向用户的文案一律纯中文。
+        _aabb_tip = (
+            " = 图元在纸面上的轴对齐包围盒(AABB)，不是图形边长。\n"
+            "旋转或镜像后 AABB 会变（图形本身没变大变小），"
+            "数字跳变属正常，不是程序出错。\n"
+            "在此输入数值 = 以当前 AABB 为基准等比缩放，"
+            "故 AABB 刚变过时同一数字的含义也会随之变。")
+        self.sp_w.setToolTip("宽" + _aabb_tip)
+        self.sp_h.setToolTip("高" + _aabb_tip)
         props.addWidget(QtWidgets.QLabel("缩放:"))
         self.sp_scale = QtWidgets.QDoubleSpinBox()
         self.sp_scale.setRange(0.05, 20.0)
@@ -1563,7 +1596,36 @@ class LayoutPage(QtWidgets.QWidget):
                                         | QtWidgets.QDialogButtonBox.Cancel)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
+        # C3：low>high 的**当场**校验。此前对话框自己不校验，用户把低阈调得
+        # 大于高阈，要等点确定、被 :meth:`_trace_image` 抛 ValueError 才弹
+        # 「重追失败」—— 那一刻参数已经出去了，界面等于撒了谎。改为当场给
+        # 中文提示 + 置灰「确定」（点了没反应 ⇒ 不关闭、不丢参数）。
+        # 提示行放在按钮**上方**，故先建后 addRow。
+        warn = QtWidgets.QLabel("")
+        warn.setWordWrap(True)
+        # 只为测试可寻址（不改行为、不改文案）：断言「有提示」而不必去猜哪一行
+        # QLabel 是提示行 —— 那会把测试焊死在措辞上。
+        warn.setObjectName("cannyThresholdWarn")
+        form.addRow(warn)
         form.addRow(bb)
+
+        def _validate_canny_thresholds() -> None:
+            """low > high ⇒ 当场说清并挡住确定（只在 Canny 模式判）。
+
+            只在 ``canny`` 模式判：其余模式 low/high 压根不参与产线
+            （见 :meth:`_image_spec`），拿它拦住「确定」就是误伤。
+            挂在模式切换上，故从 canny 切走时提示自动撤掉。
+            """
+            bad = mode.currentData() == "canny" and lo.value() > hi.value()
+            warn.setText(
+                f"Canny 低阈 {lo.value()} 不能大于高阈 {hi.value()}："
+                "请调低「低阈」或调高「高阈」后再确定。" if bad else "")
+            ok = bb.button(QtWidgets.QDialogButtonBox.Ok)
+            if ok is not None:
+                ok.setEnabled(not bad)
+
+        lo.valueChanged.connect(lambda _v: _validate_canny_thresholds())
+        hi.valueChanged.connect(lambda _v: _validate_canny_thresholds())
 
         def _sync_mode_controls() -> None:
             """模式 ⟶ 失效控件（canny 只吃 low/high，见 :meth:`_trace_image`）。
@@ -1578,6 +1640,8 @@ class LayoutPage(QtWidgets.QWidget):
             if label is not None:
                 label.setText("阈值(Canny 模式不使用):" if canny
                               else "阈值(暗→线，未勾多阈值时用):")
+            # 阈值合法性随模式而变（只在 canny 下判），故跟着模式一起重算
+            _validate_canny_thresholds()
 
         mode.currentIndexChanged.connect(lambda _i: _sync_mode_controls())
         _sync_mode_controls()

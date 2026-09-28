@@ -51,8 +51,11 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
   与**模型归属**分开：
   - 渲染：按 :func:`iter_leaves` 建 ``PathItem``，容器跳过（``make_gi`` 对
     ``is_container()`` 返回 ``None``）；
-  - 入模：``doc.add`` 只在**确无归属**时执行，判据用 :meth:`Document.contains`
-    （全树身份查找），**不是**「是否在顶层列表」。
+  - 入模：``doc.add`` 只在**确无归属**时执行，判据用
+    :meth:`Document.contains_anywhere`（**全文档**身份查找），**不是**
+    「是否在顶层列表」、也**不是**当前页的 ``contains``（A1：页删除/重排后
+    命令归属页漂移，当前页 ``contains`` 会把「挂在别页的对象」误判为
+    「不在文档里」→ ``doc.add`` 挂成第二份 → 同一几何切两遍）。
 
   组变换只写叶子集合（FR-04/FR-05），容器变换恒为恒等。
 - **镜像（FR-08）**：`mirror_x``/``mirror_y`` 布尔，**支点 = 本地 bbox 中心**
@@ -652,6 +655,11 @@ class Document:
     ⚠ ``bed_w``/``bed_h`` 刻意**不**做成 property 转发：它们是 dataclass
     字段且被 ``Document(...)`` 构造使用。改为构造时同步进页
     （:meth:`_sync_page_bed`）、切页时同步回来。
+
+    ⚠ **``contains`` 是当前页语义，「入模判据」要用 ``contains_anywhere``**
+    （A1）：页被删后撤销命令的归属页会漂移/兜底到别的页，此时对象可能挂在
+    **另一页** —— 用 ``contains``（当前页）判「不在」→ ``doc.add`` 把同一对象
+    挂成第二份 ⇒ **同一几何切两遍**。两者分工见 :meth:`contains_anywhere`。
     """
 
     pages: list[Page] = field(default_factory=lambda: [Page()])
@@ -748,6 +756,26 @@ class Document:
 
     def contains(self, item: Item) -> bool:
         return self.page.contains(item)
+
+    def contains_anywhere(self, item: Item) -> bool:
+        """**全文档**身份查找：对象是否挂在**任意一页**的树里。
+
+        与 :meth:`contains` 的分工是本轮修的关键（A1）：
+
+        - :meth:`contains` = **当前页**门面（FR-09），回答「它在不在**这一页**」，
+          用于**选择/编辑**语义（选中的东西不能是别的页的）；
+        - 本方法 = 「它**在不在文档里**」，用于**入模判据**（要不要
+          ``doc.add`` 挂上去）。
+
+        两者混用即出重复切割：命令的归属页在页被删后可能兜底到当前页，而对象
+        其实挂在**另一页** —— ``contains`` 在那页判 False ⇒ ``doc.add`` 把
+        **同一个对象**追加成第二个顶层 Item ⇒ 该几何被切两遍。实跑（删首屏 +
+        undo 一次 + redo 一次）：``p2a`` 同时出现在 p0 与 p1，合并两页
+        ``to_job_spec().paths_paper`` 同一条线出现两次 = 切纸机下两遍刀。
+
+        实现复用 :meth:`page_of`（全文档身份查找），不新写一套遍历。
+        """
+        return self.page_of(item) is not None
 
     def top_z(self) -> float:
         return self.page.top_z()

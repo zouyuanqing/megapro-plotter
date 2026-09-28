@@ -146,6 +146,20 @@ def _import_group(
     return items
 
 
+def _image_paths_to_paper(paths_svg) -> list:
+    """图片线条的**入库几何** = 组导入契约 ①②③ 在「长度 1 组」上的等价物。
+
+    导入（:meth:`LayoutPage._add_image` → :func:`_import_group`）与就地重追
+    (:meth:`LayoutPage.retrace_image_item`) **必须走同一个函数**。理由：重追
+    只换 ``paths``、不碰 pos/scale/angle（FR-10 验收③），所以它写进去的
+    ``paths`` 必须与当初**导入时逐点同一坐标系**；少走 ①②③（y 翻转 + 锚点
+    归位）的话，新折线停在 SVG y-down 原坐标系，同参数重追也会整体上下翻转
+    + 平移（会切错位置）。本函数直接复用 :func:`_import_group` 而非重写一遍
+    几何，两条链因此**不可能各自漂移**。
+    """
+    return _import_group([paths_svg], name="image")[0].paths
+
+
 def _pos_for_anchor(
     item: Item, target: tuple[float, float], anchor: str = "bl",
 ) -> tuple[float, float]:
@@ -1517,7 +1531,10 @@ class LayoutPage(QtWidgets.QWidget):
             svg = self._trace_image(source, mode=mode, threshold=threshold,
                                     use_multi=use_multi, target_mm=target_mm,
                                     low=low, high=high)
-            paths = _svg_to_paths(svg)
+            # 走组导入契约①②③（y 翻转 + 锚点归位 + 归一）—— 与**加图**同一
+            # 函数：重追只换 paths 不动 pos/scale/angle，坐标系必须与导入时
+            # 逐点一致，否则同参数重追就会整体翻转/平移（切错位置）。
+            paths = _image_paths_to_paper(_svg_to_paths(svg))
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.warning(self, "重追失败", str(exc))
             return

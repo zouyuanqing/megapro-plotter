@@ -64,11 +64,13 @@ def make_gi(page, item: Item) -> PathItem | None:
     容器 ``paths`` 为空 ⇒ ``PathItem`` 画不出东西，而 ``bbox()`` 递归后非零
     ⇒ 覆盖整组的隐形可点矩形（画不出、点得到）。渲染单元 = :func:`iter_leaves`。
 
-    **入模判据用** ``doc.contains``（全树身份查找）**而非「是否在顶层列表」**
-    （M1 评审实测的「同一几何切两遍」）：组内叶子不在 ``doc.items`` 里，
-    旧判据 ``item not in page.doc.items`` 会把每个组内叶子**追加成第二个顶层
-    Item** → ``doc.items=['G','a','b']`` 而真实几何单元只有 2 条 ⇒ 切纸机上
-    重复下刀。
+    **入模判据用** ``doc.contains_anywhere``（**全文档**身份查找）**而非
+    「是否在顶层列表」**（M1 评审实测的「同一几何切两遍」）：组内叶子不在
+    ``doc.items`` 里，旧判据 ``item not in page.doc.items`` 会把每个组内叶子
+    **追加成第二个顶层 Item** → ``doc.items=['G','a','b']`` 而真实几何单元
+    只有 2 条 ⇒ 切纸机上重复下刀。也**不能**用当前页的 ``doc.contains``：
+    页被删/重排后命令可能在**别的页**上跑，对象挂在**另一页** ⇒ 当前页判
+    False ⇒ ``doc.add`` 把它挂成第二份（A1：同一几何切两遍）。
 
     可见性用**祖先链全 visible**（M1 连带契约）：``iter_leaves`` 默认
     ``visible_only=False``（隐藏→显示可切换），故 ``item.visible`` 单独不足以
@@ -82,7 +84,7 @@ def make_gi(page, item: Item) -> PathItem | None:
     gi.setVisible(effectively_visible(page.doc, item))
     page.scene.addItem(gi)
     page._scene_items.append(gi)
-    if not page.doc.contains(item):
+    if not page.doc.contains_anywhere(item):
         page.doc.add(item)
     return gi
 
@@ -91,8 +93,8 @@ class _PageCommand(QtGui.QUndoCommand):
     """基类：持 layout page 引用，便于增删场景项。
 
     **页归属（FR-09 / PRD §11-2 定稿：单栈 + 命令页归属）**：命令在构造时
-    记下**当时所在的页下标**；``redo``/``undo`` 执行前先切到那一页，执行后
-    恢复调用者当时所在的页。
+    记下**当时的页对象**；``redo``/``undo`` 执行前先切到那一页，执行后恢复
+    调用者当时所在的页。
 
     不用「每页独立栈」的理由：用户按 Ctrl+Z 的心智是**时间上的上一步**，
     拆成每页一栈后「撤销」在页 B 上只能退 B 的历史、无法退「刚才在页 A 上
@@ -102,6 +104,26 @@ class _PageCommand(QtGui.QUndoCommand):
     场景是**一个**扁平场景，故切页必然重建（``page._rebuild_scene()``）：
     撤销一条别的页的命令时，用户会看到画面切到那一页 —— 这正是「撤销在
     撤销那一步」的正确表现。
+
+    **归属锚是页对象身份，不是下标**（A1 修）。页操作**不进撤销栈**
+    （PRD 未要求），故删页/重排后栈里残留命令的下标必然漂移：删首屏会让
+    每条残留命令的 home 整体少 1、越界的那条又退回 ``doc.current``。
+    实跑（3 页各 1 图元 → 删首屏 → undo 一次 + redo 一次）：``p2a`` 的
+    home=2 越界退回 0，在 p0 上做入模判定 → **同一个对象同时挂在 p0 与
+    p1**，合并两页几何同一条线出现两次 = 切纸机下两遍刀；删中间/末页则是
+    被删页的内容**复活**到某个存活页。``move_page`` 重排是同一根因
+    （下标漂移，撤销打到别的页）。改用页对象身份后两者一并消失：
+
+    - ``add_page``/``duplicate_page`` 造**新** ``Page`` 对象、``remove_page``
+      只是丢引用、``move_page`` 移动引用 ⇒ **身份在增删/重排下稳定**；
+    - 锚对象被删则**永不回来** ⇒ :meth:`_resolve_home` 每次都返回 ``None``，
+      命令稳定地降级为空操作 ⇒ **不累积错位**（改前每次 undo 都把
+      ``_home_page`` 改写成 current，多个来回逐次漂移）。
+
+    :meth:`_run` 在锚页已删时**整个空操作**（不动模型、不动场景、不动视图
+    页）—— 这是唯一语义正确的选择：命令改的图元随它的页一起消失了，撤销
+    「编辑一个不存在的页」只能是「什么都不做」。旧实现的「退回当前页执行」
+    恰恰是**错**的：它把命令应用到不相干的页上。
     """
 
     def __init__(self, page, text: str):
@@ -109,13 +131,30 @@ class _PageCommand(QtGui.QUndoCommand):
         self.page = page
         doc = getattr(page, "doc", None)
         self._home_page: int = getattr(doc, "current", 0) if doc else 0
+        # 页锚 = 页对象身份（活引用）。``None`` 只在 page 无 doc 时出现，
+        # 此时命令本就无处执行（与旧 ``_home_page`` 退化成 0 的情形一致）。
+        self._home_page_obj = doc.page if doc is not None else None
 
-    def _activate_page(self) -> int:
+    def _resolve_home(self) -> int | None:
+        """本命令归属页的**当前**下标；锚页已删（或无 doc）返回 ``None``。
+
+        刻意用显式循环 + ``is`` 而非 ``doc.pages.index(obj)``：**``Page`` 是
+        dataclass（``eq=True``）**，两个空页 ``Page() == Page()`` 为真 ⇒
+        ``index()`` 会把另一个页当成锚页命中。同理不得写 ``pg == anchor``。
+        """
+        if self._home_page_obj is None:
+            return None
+        for i, pg in enumerate(self.page.doc.pages):
+            if pg is self._home_page_obj:
+                return i
+        return None
+
+    def _activate_page(self, home: int) -> int:
         """切到本命令的归属页（若已在该页则无副作用）；返回切换前的页下标。"""
         doc = self.page.doc
         prev = doc.current
-        if prev != self._home_page:
-            doc.switch_page(self._home_page)
+        if prev != home:
+            doc.switch_page(home)
             self.page._rebuild_scene()
         return prev
 
@@ -129,16 +168,18 @@ class _PageCommand(QtGui.QUndoCommand):
     def _run(self, fn) -> None:
         """在归属页上执行 ``fn``，随后恢复调用者的页。
 
-        页面下标越界（页被删）时退回当前页执行，不抛异常 —— 页操作类命令
-        （增/删/复制/重排页）本身就会改页数，栈里更早的命令其归属页可能已
-        不存在，那时**就地**在其存在的页上撤销是唯一合理行为。
+        **归属页已被删除 ⇒ 整个命令空操作**（不动模型/场景/视图页，不抛）。
+        旧实现是「下标越界就退回 ``doc.current`` 执行」，那是 A1 的病灶：
+        残留命令被应用到**不相干的页**上，把图元挂错页甚至挂成两份。
+
+        空操作**不累积**：锚页对象一旦被删就永不再进 ``doc.pages``，故每次
+        redo 都解析到同一个 ``None``，反复 undo/redo 结果稳定。
         """
-        doc = self.page.doc
-        home = self._home_page
-        if not (0 <= home < doc.page_count):
-            home = doc.current
-            self._home_page = home
-        prev = self._activate_page()
+        home = self._resolve_home()
+        if home is None:
+            return
+        self._home_page = home  # 供调试/子类读取的最近一次归属下标
+        prev = self._activate_page(home)
         try:
             fn()
         finally:
@@ -158,7 +199,11 @@ class AddItemsCommand(_PageCommand):
 
     def _rebuild_scene(self) -> None:
         for top in self.items:
-            if not self.page.doc.contains(top):
+            # **全文档**判据（``contains_anywhere``，不是当前页 ``contains``）：
+            # 页删除/重排后本命令可能跑在归属页之外的页上，此时对象挂在别的
+            # 页里；用当前页判「不在」⇒ ``doc.add`` 挂成第二份 ⇒ 同一几何切
+            # 两遍（A1）。
+            if not self.page.doc.contains_anywhere(top):
                 self.page.doc.add(top)
             for leaf in iter_leaves([top]):
                 if self.page._gi_for(leaf) is None:

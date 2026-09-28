@@ -560,6 +560,33 @@ class LayoutPage(QtWidgets.QWidget):
     # 组叶子集 ⇒ 一条 ``ChangeItemPropsCommand``。二者都是**零新增渲染通路**。
 
     def _refresh_undo_actions(self) -> None:
+        """把 undo/redo 的文案重写成「前缀 + 栈顶命令名」。
+
+        ⚠ **C4 实测：这是空转，且不要再给它接 ``indexChanged``。**
+        工具条上的 action 是 :meth:`QUndoStack.createUndoAction` 建的
+        ``QUndoAction``，**Qt 自己**就在每次 push/undo/redo/clear 时把文案重写成
+        ``前缀 + undoText()``、把可用态重算成 ``canUndo()``/``canRedo()``；工具条
+        按钮是 ``setDefaultAction(a)`` 装的，跟着 action 走。实测逐拍轨迹：
+
+            初始    撤销(禁用)        重做(禁用)
+            添加后  撤销 添加(可用)    重做(禁用)
+            镜像后  撤销 水平镜像(可用) 重做(禁用)
+            撤销后  撤销 水平镜像(可用) 重做 层序(可用)
+            撤到底  撤销(禁用)        重做 添加(可用)
+
+        本方法在 :meth:`__init__` 里只被调一次，且那一刻栈是空的 ——
+        ``undoText()`` 为 ``''``、``f"撤销 ".strip()`` 仍是「撤销」，与 Qt 已有的
+        文案**逐字相同**，所以它不改变任何可见状态。
+
+        「把它接到 ``indexChanged`` 上」是个看起来很自然的修法，但它是**倒退**：
+        ① 本来就没有缺陷可修；② 会在栈每次变动时多跑一遍完全多余的工作（拖动、
+        绘制等高频手势都吃这个代价）；③ 一旦将来 Qt 改了文案规则（分隔符、前缀），
+        我们这套手写拼接就会与 Qt 的分叉，出现两处不一致的真相。
+
+        行为由 tests/test_gui_layout_undo_actions.py 钉住 —— 那些用例
+        **不调用**本方法就能观察到文案实时变化；哪天有人把 ``createUndoAction``
+        换成普通 ``QAction``（或去掉 ``setDefaultAction``），本文件立刻会红。
+        """
         if hasattr(self, "_undo_act"):
             self._undo_act.setText(f"撤销 {self._undo.undoText()}".strip())
             self._redo_act.setText(f"重做 {self._undo.redoText()}".strip())

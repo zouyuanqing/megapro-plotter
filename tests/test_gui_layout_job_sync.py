@@ -11,9 +11,11 @@
 新增一条**独立于导出按钮**的信号，只做 ``_job_spec`` 赋值 + ``_recompile``，
 不切标签页、不打控制台；页切换按一个**默认开**的中文开关决定是否走它。
 
-范围守卫：镜像/移动/增/删等编辑**故意不接**这条通道（产品未拍板，见
-``test_layout_edits_do_not_emit_job_sync``）—— 本文件既钉住要连的，也钉住
-不许连的。
+范围守卫（**C2 已改**）：本文件原先还钉了一条「镜像/移动/增/删**故意不接**这条
+通道（产品未拍板）」，由 ``test_layout_edits_do_not_emit_job_sync`` 承担。用户
+已拍板**接上**（复用同一个开关、默认开），该用例与文件头注释一并按新契约重写
+为 ``test_layout_edits_emit_job_sync_each``（+ 开关关的对照）—— 断言方向反转，
+且由「一律不发」**收紧**为「每次编辑各发一次」，少发一次照样红。
 """
 
 import os
@@ -257,33 +259,87 @@ def test_param_change_still_recompiles_after_sync():
     w.close()
 
 
-# --- 范围守卫：其它编辑**故意不接**这条通道 --------------------------------
+# --- C2：编辑类动作**接上**这条通道（产品已拍板，替代原范围守卫） ------------
 
-def test_layout_edits_do_not_emit_job_sync():
-    """镜像/移动/增/删**不**发同步信号（产品未拍板，故意不接）。
+def _emit_counter(lp):
+    seen: list = []
+    lp.job_sync_requested.connect(lambda spec: seen.append(spec))
+    return seen
 
-    这是范围守卫，不是缺陷复现：接了「只连页切换」这条通道时，它保证没人
-    顺手把编辑类动作也接上（那会让每次拖动都重编译整份作业）。
+
+def test_layout_edits_emit_job_sync_each():
+    """镜像/移动/增/删**各自**发一次同步（逐次断言，不是「总数 > 0」）。
+
+    替代原 ``test_layout_edits_do_not_emit_job_sync``（范围守卫「故意不接」）。
+    那条守卫编码的是「产品未拍板」，而用户已拍板**接上**：用户在排版页改完、切到
+    作业页会看到陈旧几何并可能直接执行。断言方向随之反转，且由「一律不发」**收紧**
+    为「每次编辑各发一次」—— 少发一次照样红。
+
+    另钉两条：每次发的 spec 是**当时**的版面几何（不是首帧的旧 spec），以及页切换
+    仍照发（对照，证明信号本身是通的）。
+    """
+    from megapro.gui.canvas.undo_cmds import MoveItemsCommand
+    from megapro.gui.layout.model import Item, flatten_visible
+
+    w = _make_window()
+    lp = w.layout_page
+    seen = _emit_counter(lp)
+
+    def step(fn, what):
+        n = len(seen)
+        fn()
+        assert len(seen) == n + 1, \
+            f"{what} 应各发一次同步，实际发了 {len(seen) - n} 次"
+        # 带上的是**这次编辑之后**的版面几何
+        assert seen[-1].paths_paper == flatten_visible(lp.doc), \
+            f"{what} 同步的 JobSpec 与当时版面不一致"
+
+    step(lambda: lp._add_items([Item(paths=[list(p) for p in _P0], name="p0")]),
+         "新增图元")
+    it = lp.doc.items[0]
+    lp._gi_for(it).setSelected(True)
+
+    step(lambda: lp._toggle_mirror("h"), "镜像")
+    step(lambda: lp._undo.push(MoveItemsCommand(lp, [(it, it.pos, (5.0, 7.0))])),
+         "移动")
+    step(lambda: lp._add_items([Item(paths=[[(1.0, 1.0), (2.0, 2.0)]], name="x")]),
+         "再新增")
+
+    lp._gi_for(it).setSelected(True)          # 删除目标显式勾上，不靠上一个动作
+    step(lp._delete_selected, "删除")
+
+    # 对照：页切换仍要发
+    n = len(seen)
+    lp._on_page_add()
+    assert len(seen) == n + 1, "页切换仍应发一次同步"
+    w.close()
+
+
+def test_layout_edits_do_not_emit_job_sync_when_switch_off():
+    """开关**关** ⇒ 同样四类编辑一律不发（开关语义覆盖编辑，不只管页切换）。
+
+    与 :meth:`test_layout_edits_emit_job_sync_each` 成对：开关开时四类编辑都发，
+    关时都不发 —— 若只把开关接到页切换那条路上，编辑会无视开关继续发，本条即红。
     """
     from megapro.gui.canvas.undo_cmds import MoveItemsCommand
     from megapro.gui.layout.model import Item
 
     w = _make_window()
     lp = w.layout_page
-    seen: list = []
-    lp.job_sync_requested.connect(lambda spec: seen.append(spec))
+    lp._sync_job_cb.setChecked(False)
+    seen = _emit_counter(lp)
+
     lp._add_items([Item(paths=[list(p) for p in _P0], name="p0")])
     it = lp.doc.items[0]
-    assert seen == [], "加图元本身不该发同步"
-
     lp._gi_for(it).setSelected(True)
     lp._toggle_mirror("h")                                   # 镜像
     lp._undo.push(MoveItemsCommand(lp, [(it, it.pos, (5.0, 7.0))]))  # 移动
     lp._add_items([Item(paths=[[(1.0, 1.0), (2.0, 2.0)]], name="x")])
+    lp._gi_for(it).setSelected(True)
     lp._delete_selected()
-    assert seen == [], f"编辑类动作不该发同步，实际发了 {len(seen)} 次"
+    assert seen == [], f"开关关时编辑仍发了同步，实际 {len(seen)} 次"
 
-    # 但**页切换**要发（对照，证明信号本身是通的）
+    # 开关关时页切换同样不发（同一口径）
     lp._on_page_add()
-    assert len(seen) == 1, "页切换应发一次同步"
+    assert seen == [], f"开关关时页切换仍发了同步，实际 {len(seen)} 次"
     w.close()

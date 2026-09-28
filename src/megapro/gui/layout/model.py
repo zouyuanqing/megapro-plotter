@@ -720,11 +720,19 @@ class Page:
             owner.children.insert(index, item)
 
     def sorted_items(self) -> list[Item]:
-        """全部**几何拥有者**（容器展开），按 z 升序（小 z 先画=在下层）。
+        """全部**可渲染单元**（容器展开），按 z 升序；**含 ``paths==[]`` 的叶子**。
 
-        「几何拥有者」= 自身 ``paths`` 非空的图元：叶子恒是，带自身折线的容器
-        也是（容器自身折线是一等几何，见 :func:`iter_flattens`）——枚举面必须
-        与拍平面同口径，否则容器自身折线会从越界预检里消失。
+        口径 = 「有没有东西可画」，与 :func:`_own_geometry` 同源：
+        叶子恒是（哪怕自身 ``paths`` 为空），容器**自带折线**时也是（容器自身
+        折线是一等几何，见 :func:`iter_flattens`）。空容器不是（它不建
+        ``PathItem``，见 ``test_gui_layout_remove_undo.py:246``）。
+        要问「对象在不在文档里」用 :meth:`contains` —— 那是另一个问法。
+
+        ⚠ **A2 修的就是这里的 ``paths==[]`` 丢失**（原实现一律丢掉）：
+        ``Document(items=[a(1条), empty(paths=[]), b])`` 修复前给 ``['a','b']``
+        丢掉 ``empty``，而同一份文档里 ``contains(empty)=True``、
+        ``top_z()`` 算进它的 z、``remove(empty)`` 摘得掉。基线
+        ``git show 2fb1e47`` 的 ``sorted(self.items, key=z)`` **全都产出**。
 
         **tie-break = 入档序**（A4），与 :func:`flatten_visible` 同一口径：
         枚举面若按 DFS 先序解并列，编组一次就会让「层序」随树形漂移。
@@ -734,7 +742,7 @@ class Page:
                       key=lambda it: (it.z, it.order))
 
     def items_visible(self) -> list[Item]:
-        """可见**几何拥有者**（同上），按 z 升序（并列按入档序，A4）。
+        """可见**可渲染单元**（同 :meth:`sorted_items` 的口径），按 z 升序。
 
         隐藏容器跳过整棵子树（组内成员逐个隐藏仍有效）。
         """
@@ -905,9 +913,24 @@ class Document:
     （``tests/test_gui_layout.py`` 全部 Document 级用例不改字通过 =
     门面逐位不变的可执行证明）。
 
-    ⚠ ``bed_w``/``bed_h`` 刻意**不**做成 property 转发：它们是 dataclass
-    字段且被 ``Document(...)`` 构造使用。改为构造时同步进页
-    （:meth:`_sync_page_bed`）、切页时同步回来。
+    **床尺寸的唯一真源是 :class:`Page`**（A2 重做，M4 原设计已推翻）。本类的
+    ``bed_w``/``bed_h`` 是**读写直通**的 property（不是字段）：读即读当前页、
+    写即写当前页。于是「``doc.bed_w`` 恒等于 ``doc.page.bed_w``」不再是**需要
+    每条路径都记得同步**的纪律，而是**只有一个存储位置**的结构事实 ——
+    构造、赋值、``switch_page``/``add_page``/``duplicate_page``/
+    ``remove_page``/``move_page`` 之后**恒成立**，也不存在「以后新加一条
+    路径忘了同步」的可能。
+
+    ⚠ M4 原设计是「两处存 + ``_sync_page_bed`` 手工同步」，它有**五条漏同步
+    路径**（A2 实测，全部静默）：①``Document(pages=[Page(bed_w=100)])`` 把
+    调用方给的 100 覆盖成 210；②``doc.bed_w=150`` 只改文档不改页，且
+    ``switch_page`` 指向当前页时提前 return 不拉 ⇒ **脱节永不自愈**；
+    ③④删/复制当前页后 ``current`` 变了、门面值没跟上；⑤``move_page`` 改
+    ``current`` 同理。补齐五条是一样容易漏第六条的做法，故改成单一真源。
+
+    构造语义随之改为「``bed_w``/``bed_h`` 关键字写进**当前页**；``None``
+    （默认）表示不碰、保留该页自己声明的值」—— 这是 ① 的正解：调用方给了
+    ``Page(bed_w=100)`` 就该保留 100，而不是被 Document 的默认值顶掉。
 
     ⚠ **``contains`` 是当前页语义，「入模判据」要用 ``contains_anywhere``**
     （A1）：页被删后撤销命令的归属页会漂移/兜底到别的页，此时对象可能挂在
@@ -917,15 +940,13 @@ class Document:
 
     pages: list[Page] = field(default_factory=lambda: [Page()])
     current: int = 0
-    bed_w: float = BED_W
-    bed_h: float = BED_H
     #: 兼容构造：``Document(items=[...])``（既有测试与 ``layout_page`` 依赖）。
     #: 非 None 时这些图元进当前页。**不是** dataclass 字段（``items`` 是
     #: property，同名字段会冲突），只在本类自定义 ``__init__`` 里消费。
     _init_items: list[Item] | None = field(default=None, repr=False)
 
     def __init__(self, pages: list[Page] | None = None, current: int = 0,
-                 bed_w: float = BED_W, bed_h: float = BED_H,
+                 bed_w: float | None = None, bed_h: float | None = None,
                  items: list[Item] | None = None) -> None:
         """**自定义构造**（不再用 dataclass 生成的 ``__init__``）。
 
@@ -933,12 +954,21 @@ class Document:
         dataclass 字段不能与 property 同名。既有代码/测试广泛使用
         ``Document(items=[...])``，故在此显式接受该关键字并放进当前页 ——
         单页文档下与旧行为**逐位相同**。
+
+        ``bed_w``/``bed_h`` 语义（A2）：**写进当前页**；``None``（默认）= 不碰，
+        保留该页自己声明的值。故 ``Document(pages=[Page(bed_w=100.0)])`` 保住
+        100（M4 的同步机器会把它顶成 210）。显式传值时以关键字为准
+        （``Document(pages=[Page(bed_w=100.0)], bed_w=300.0)`` ⇒ 当前页 300）。
         """
         self.pages = list(pages) if pages else [Page()]
         self.current = int(current)
-        self.bed_w = float(bed_w)
-        self.bed_h = float(bed_h)
         self._init_items = list(items) if items is not None else None
+        self._clamp_current()
+        # 床尺寸走 property setter（直通当前页），故必须排在 pages/current 之后
+        if bed_w is not None:
+            self.bed_w = float(bed_w)
+        if bed_h is not None:
+            self.bed_h = float(bed_h)
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -952,7 +982,8 @@ class Document:
                 _stamp_order(it)
             self.page.items = list(self._init_items)
             self._init_items = None
-        self._sync_page_bed(to_page=True)
+        # ⚠ 这里**不再**有床尺寸同步（A2）：bed_w/bed_h 是直通当前页的 property，
+        # 同步由 property 本身完成，此处再写一遍就是「两处存」的老 bug。
 
     def _clamp_current(self) -> None:
         if not self.pages:
@@ -960,19 +991,25 @@ class Document:
         if not (0 <= self.current < len(self.pages)):
             self.current = 0
 
-    def _sync_page_bed(self, *, to_page: bool) -> None:
-        """床尺寸在 Document 与当前页之间同步。
+    # -- 床尺寸门面：直通当前页（A2 单一真源） -------------------------------
 
-        ``to_page=True`` 用 Document 的值写进页（构造时）；``to_page=False``
-        用页的值写回 Document（切换页时，让门面字段跟随当前页）。
-        """
-        page = self.page
-        if to_page:
-            page.bed_w = self.bed_w
-            page.bed_h = self.bed_h
-        else:
-            self.bed_w = page.bed_w
-            self.bed_h = page.bed_h
+    @property
+    def bed_w(self) -> float:
+        """当前页的床宽（**活读**，不缓存 ⇒ 切页/删页/复制页后自动跟随）。"""
+        return self.page.bed_w
+
+    @bed_w.setter
+    def bed_w(self, value: float) -> None:
+        self.page.bed_w = float(value)
+
+    @property
+    def bed_h(self) -> float:
+        """当前页的床高（同 :attr:`bed_w`，活读）。"""
+        return self.page.bed_h
+
+    @bed_h.setter
+    def bed_h(self, value: float) -> None:
+        self.page.bed_h = float(value)
 
     # -- 当前页门面（全部委托到 Page） --------------------------------------
 
@@ -1117,12 +1154,13 @@ class Document:
     def switch_page(self, index: int) -> bool:
         """切换当前页（越界或原地返回 False，不改状态）。
 
-        切页时床尺寸**跟随页**（同步回 ``doc.bed_w/bed_h`` 门面字段）。
+        床尺寸**自动跟随页**：``bed_w``/``bed_h`` 是直通当前页的 property
+        （A2），故这里**不需要**任何同步动作 —— 这正是改成单一真源的好处：
+        「切页时要不要同步」不再是每条路径都要答对的问题。
         """
         if not (0 <= index < len(self.pages)) or index == self.current:
             return False
         self.current = index
-        self._sync_page_bed(to_page=False)
         return True
 
     def page_of(self, item: Item) -> int | None:
@@ -1238,14 +1276,41 @@ def iter_flattens(items: list[Item], *, visible_only: bool = True):
 
 
 def _own_geometry(items: list[Item], *, visible_only: bool = True):
-    """深度优先收集**自身折线非空**的图元（几何拥有者），每项只出现一次。
+    """深度优先收集**有东西可画的单元**：叶子（含 ``paths==[]`` 的），
+    以及**自带折线的**容器。每项只出现一次。
 
-    与 :func:`iter_flattens` 同口径遍历 —— 枚举面（``items_visible`` /
-    ``sorted_items``）必须看得见容器自身折线，否则它能进导出/送作业却进不了
-    越界预检（layout_page._on_export）。容器本身也是「拥有者」时才算。
+    ⚠ **本函数名是历史遗留**（A2 前的语义更窄）。**不能随手改名** ——
+    ``tests/test_gui_layout_tree_guard.py`` 的入口清单按**这个名字**探测深度
+    守卫；改名会让那条既有用例 NameError。名字该改，但要连那份清单一起改，
+    不在本批所有权内。
+
+    **A2 改了什么**：原实现是 ``if paths:``，把 ``paths==[]`` 的图元**一律**
+    丢掉。于是同一份文档里 ``contains(empty)=True``、``top_z()`` 算进它的 z、
+    ``remove(empty)`` 摘得掉，``sorted_items()``/``items_visible()`` 却**看不见**
+    它 —— 身份面看得见、枚举面看不见。现判据改为
+    **「有折线」**或**「不是容器」**：空的**叶子**照常产出（它确实是一个
+    图元，且画布侧 ``make_gi`` 也确实给它建了 ``PathItem``）。
+
+    **空容器仍然不产出**（A2 刻意保留，非遗漏）：四条既有断言把这个契约钉死了
+    —— ``test_gui_layout.py:516/517``（``[组(children=[l0,l1,l2])]`` 的
+    ``sorted_items()`` 是 ``['l0','l1','l2']``，不含 ``组``）、
+    ``test_gui_layout_remove_undo.py:246``（``items_visible()`` 里每一项都必须
+    ``_gi_for(...) is not None``，而**容器不建 PathItem**）。即本方法的含义是
+    「**可渲染单元**」，与 :meth:`Page.contains` 的「对象在不在文档里」是两个
+    不同的问法，**故意**不同口径。问「在不在」请用 :meth:`Page.contains` /
+    :func:`iter_items`；问「有没有可画的」用本函数；要页面系几何走
+    :func:`iter_units`。
+
+    **与基线的位一致性**：无 children 文档里每个图元都是叶子 ⇒ 全部产出 ⇒
+    等同基线 ``sorted(self.items, key=z)``（并列 z 的 tie-break 见 A4：
+    ``order`` == 列表序）。基线 ``git show 2fb1e47:model.py`` 是
+    ``sorted(self.items, key=z)`` —— **全都产出**，含 ``paths==[]``。
+
+    遍历仍借 :func:`iter_flattens` 拿（可见性过滤 + 深度守卫），只是不再用它
+    的 ``paths`` 当唯一判据。
     """
     for it, paths, _chain in iter_flattens(items, visible_only=visible_only):
-        if paths:
+        if paths or not it.is_container():
             yield it
 
 

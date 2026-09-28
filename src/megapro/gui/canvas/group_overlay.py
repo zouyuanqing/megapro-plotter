@@ -12,13 +12,20 @@
 - 组框画的是**容器 page_bbox 的页面系矩形**（:meth:`Item.unit_page_bbox` 带祖先
   链 —— M1 缺口 #1：裸 ``page_bbox()`` 不走祖先，编组后会漏报/错位）。
 - 命中 = 整组叶子被点中 → 选中整组（组选中 = 叶子集）。
+- **嵌套（组套组）**：每层容器各画一个框，判据是「子树叶子传递闭包 ⊆ 当前
+  叶子选择集」，枚举走 :func:`iter_units`（任意深度）—— 见
+  :meth:`GroupOverlay._complete_groups`。
+- ⚠ **框的几何不得随缩放缩放**：线宽已是 cosmetic（``set_width(0)``，恒 1
+  设备像素），框本身必须与 ``page_bbox`` 逐位重合。故这里**没有**
+  ``setScale(1/ppm)``（旧实现有：注释称「不改变几何」是错的，``setScale`` 就是
+  几何缩放，会把框缩到 1/ppm 并朝页原点平移 —— 框不再框住组）。
 """
 
 from __future__ import annotations
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from megapro.gui.layout.model import Item, iter_units
+from megapro.gui.layout.model import Item, iter_leaves, iter_units
 
 __all__ = ["GroupOverlay", "GroupFrameItem"]
 
@@ -30,10 +37,12 @@ _FRAME_DASH = (4.0, 3.0)
 class GroupFrameItem(QtWidgets.QGraphicsItem):
     """单个组框（自管 gi，不进选择集、不建 PathItem）。"""
 
-    def __init__(self, rect: QtCore.QRectF, owner) -> None:
+    def __init__(self, rect: QtCore.QRectF, owner, container: Item) -> None:
         super().__init__(None)  # 显式无 parent（D1：禁止 Qt 父子）
         self._rect = rect
         self.owner = owner
+        #: 本框对应的**容器**（框 ↔ 容器一一对应；嵌套下每层各一个）
+        self.container = container
         self.setZValue(1e5)  # 在 PathItem 之上、SelectionHandles 之下
         self.setAcceptedMouseButtons(QtCore.Qt.NoButton)  # 纯显示
 
@@ -88,28 +97,38 @@ class GroupOverlay:
         if doc is None or not selected_items:
             return
         sel = {id(it) for it in selected_items}
-        for cont, leaves in self._complete_groups(doc, sel):
+        for cont in self._complete_groups(doc, sel):
             rect = self._rect_of(cont, page_box)
             if rect is None:
                 continue
-            f = GroupFrameItem(rect, self)
+            f = GroupFrameItem(rect, self, cont)
             self._frames.append(f)
             self._scene.addItem(f)
 
-    def _complete_groups(self, doc, sel: set[int]) -> list[tuple[Item, list[Item]]]:
-        """找出「成员全被选中」的容器（直接子容器即可，嵌套时内层先画）。
+    def _complete_groups(self, doc, sel: set[int]) -> list[Item]:
+        """找出「子树叶子**全部**被选中」的容器 —— **任意深度**，含嵌套。
 
-        判据 = 该容器的**直接子项**全部在选择集里。组选中 = 叶子集（FR-05），
-        故普通态下用户点一个成员即选中整组（见 :meth:`LayoutPage._expand_group_selection`），
-        到这里必然是「全选」。
+        判据 = 该容器子树的**叶子传递闭包** ⊆ 当前叶子选择集（组选中 = 叶子集，
+        FR-05 v1.2；容器不建 PathItem、不进选择集，故选择集里只有叶子）。
+        枚举走 :func:`iter_units`（任意深度 + :data:`MAX_TREE_DEPTH` 守卫），
+        不再只看 ``doc.items`` 一层。
+
+        ⚠ 旧判据是「**直接子项**全在叶子集里」，组套组时立刻失效：外层容器的
+        直接子项是**内层容器**，而容器永远不在叶子集里 ⇒ 判据恒 False；内层
+        容器又不在 ``doc.items`` 里 ⇒ 永不被考察。实跑（3 图元连续编组两次）
+        ⇒ 顶层 ``['组3']``/children ``['组3']``、3 叶子全选，而组框数 **0**。
+        深度 1 时叶子闭包 == 直接子项集合，与旧判据**逐位等价**。
+
+        顺序 = :func:`iter_units` 的 DFS 前序（外层在前）⇒ 嵌套时内层框后画、
+        压在外层之上。
         """
-        out: list[tuple[Item, list[Item]]] = []
-        for cont in doc.items:
+        out: list[Item] = []
+        for cont, _chain in iter_units(doc.items, visible_only=False):
             if not cont.is_container():
                 continue
-            kids = list(cont.children)
-            if kids and all(id(k) in sel for k in kids):
-                out.append((cont, kids))
+            leaf_ids = {id(lf) for lf in iter_leaves([cont])}
+            if leaf_ids and leaf_ids <= sel:   # 容器必有叶子后代（is_container）
+                out.append(cont)
         return out
 
     def _rect_of(self, cont: Item, page_box) -> QtCore.QRectF | None:
@@ -124,12 +143,6 @@ class GroupOverlay:
             self._scene.removeItem(f)
         self._frames.clear()
 
-    def update_sizes(self) -> None:
-        """组框恒定屏幕线宽：整体 1/ppm（不改变几何，只让线宽看着一致）。"""
-        ppm = abs(self._view.transform().m11()) or 1.0
-        for f in self._frames:
-            f.setScale(1.0 / ppm)
-
     # -- 编辑态 -------------------------------------------------------------
 
     def set_editing(self, container: Item | None) -> None:
@@ -143,4 +156,3 @@ class GroupOverlay:
         if page is None:
             return
         self.sync([gi.model_item for gi in page._selected()], page_box=page_box)
-        self.update_sizes()

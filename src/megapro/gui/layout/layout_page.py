@@ -31,6 +31,8 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+import shiboken6
+
 from megapro.gui.canvas.coords import (
     BED_H,
     BED_W,
@@ -299,6 +301,13 @@ class LayoutPage(QtWidgets.QWidget):
         self._prop_token: int | None = None
         self._prop_sender = None
         self._undo = QtGui.QUndoStack(self)
+        # C2：排版页**任何**会改变 ``flatten_visible`` 的编辑都静默同步作业预览
+        # （镜像 / 移动（微调与拖动）/ 新增 / 删除，另含粘贴复制、撤销重做、层序、
+        # 对齐缩放旋转）。挂在撤销栈而非逐个编辑入口，因为拖动的
+        # ``MoveItemsCommand`` 由 ``canvas/items.py`` 直接 push 到本栈。
+        # 开关与门禁见 :meth:`_maybe_emit_job_sync`；_sync_models() 不 push
+        # （纯 model→场景），故 :meth:`to_job_spec` 不会递归回来。
+        self._undo.indexChanged.connect(self._on_undo_index_changed)
         self._build_ui()
         self._refresh_page_bar()  # 建首个页签（默认单页）
         self._refresh_props()
@@ -626,15 +635,36 @@ class LayoutPage(QtWidgets.QWidget):
             self._after_change()
             self._maybe_emit_job_sync()
 
+    def _on_undo_index_changed(self, _idx: int) -> None:
+        """撤销栈变动 → 按开关静默同步作业预览（C2，见 :meth:`__init__` 接线）。
+
+        ⚠ **析构期必须早退**：``QUndoStack`` 以本页为 parent，页面析构时它的
+        ``indexChanged`` 仍会发；此刻本页的 C++ 侧已在拆，Python 侧取到的
+        ``job_sync_requested`` 退化成无参信号，再 ``emit(spec)`` 就抛
+        ``TypeError: only accepts 0 argument(s), 1 given``（未捕获 ⇒ 打印
+        traceback）。实测：只要有 ``LayoutPage`` 未 ``deleteLater()`` 就被 GC，
+        每次收尾都会喷一次。析构期同步本就无意义（窗口都要没了），故先判存活。
+        """
+        if not shiboken6.isValid(self):
+            return
+        self._maybe_emit_job_sync()
+
     def _maybe_emit_job_sync(self) -> None:
-        """当前页**确实切换**后，按开关把版面静默同步到作业页（PRD §10.1-8）。
+        """按开关把版面**静默**同步到作业页（PRD §10.1-8 + C2 裁决）。
 
         走 :attr:`job_sync_requested` 而非 :attr:`export_requested`：后者在
         MainWindow 侧会 ``setCurrentIndex(0)`` 把用户踢出排版页并刷一行控制台，
-        而页切换是高频轻量动作。开关默认开，勾选状态读 :attr:`_sync_job_cb`。
+        而同步是高频轻量动作。开关默认开，勾选状态读 :attr:`_sync_job_cb` ——
+        **页切换与各类编辑共用这一个开关**（C2：四类编辑也要受它管，否则开关
+        语义分叉）。
 
-        ⚠ 范围：只接**页切换**这一个触发点。镜像/移动/增/删等编辑是否也同步
-        作业预览是尚未拍板的产品决定，故 ``_after_change`` 链**不**发本信号。
+        触发点挂在**撤销栈**（``QUndoStack.indexChanged``，见 :meth:`__init__`），
+        而非逐个编辑入口 —— 拖动的 ``MoveItemsCommand`` 是 ``canvas/items.py``
+        直接 push 到 ``page._undo`` 的，逐点挂钩抓不到最常见的「移动」。
+
+        本方法**只负责发信号**；作业页那侧的两道门禁（来源 + 执行中）由
+        :meth:`MainWindow._on_layout_job_sync` 既有实现承担，此处不重复也不
+        绕过：非排版来源的作业在那边整段早退。
         """
         cb = getattr(self, "_sync_job_cb", None)
         if cb is not None and not cb.isChecked():
@@ -1244,26 +1274,46 @@ class LayoutPage(QtWidgets.QWidget):
         **保持组内相对次序**，全部一条命令。
 
         「up/down」按组内**最小** z 判档、整体平移同一增量（保持组内间距）；
-        「top/bottom」把整组压到全树最上/最下（组内相对次序仍保留）。
+        「top/bottom」把**全部选中叶子**压到全树最上/最下的一段**连续** z 区间。
+
+        ⚠ top/bottom 的基准必须**在循环外算一次**、循环内用**游标**递推。变更
+        统一到循环**之后**才一次 ``push``（单命令契约），故循环里
+        ``self.doc.top_z()`` 读到的恒是同一个值 —— 单元**内部**递推、单元
+        **之间**不递推。实测（C2）：X(散件 z=50) + 组 G{M0(1), M1(2)} + 散件
+        M2(3)，全选 G 与 M2 置顶 ⇒
+
+            修复前  M0=51, M1=52, M2=51   ← M2 与 M0 同 z
+            拍平序  [X, M0, M2, M1]       ← 散件插进组中间，切割次序被打乱
+            修复后  M0=51, M1=52, M2=53   ← 选中集 {51,52,53} 连续一段
+
+        拍平序 = 切割次序（:func:`flatten_visible` 走 ``key=z`` 稳定排序），所以
+        这不是画布显示问题，是发往机器的 G-code 次序变了。
         """
         sel = self._selected()
         if not sel:
             return
+        # 基准：一次算好，循环内只推进游标（见 docstring 的 ⚠）
+        if mode == "top":
+            cursor = self.doc.top_z() + 1
+        elif mode == "bottom":
+            cursor = self.doc.bottom_z() - 1
+        else:
+            cursor = None
         changes = []
         for unit, _ in self._selected_units():
             leaves = self._leaves_of_unit(unit)
             if not leaves:
                 continue
-            zs = [it.z for it in leaves]
-            if mode == "top":
-                new_zs = [self.doc.top_z() + 1 + i for i in range(len(leaves))]
-            elif mode == "bottom":
-                base = self.doc.bottom_z() - 1
-                new_zs = [base + i for i in range(len(leaves))]
-            else:
+            if cursor is None:            # up / down：各单元按自身 z 平移 ±1
+                zs = [it.z for it in leaves]
                 cur = min(zs) if mode == "up" else max(zs)
                 delta = 1.0 if mode == "up" else -1.0
                 new_zs = [z + delta for z in zs]
+            else:                          # top / bottom：跨单元连续铺开
+                new_zs = []
+                for _ in leaves:
+                    new_zs.append(cursor)
+                    cursor += 1
             for it, nz in zip(leaves, new_zs):
                 if it.z != nz:
                     changes.append((it, {"z": it.z}, {"z": nz}))

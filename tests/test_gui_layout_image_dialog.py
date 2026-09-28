@@ -348,45 +348,84 @@ def _gradient_png(tmp_path):
     return str(p)
 
 
-def test_canny_really_ignores_threshold_and_multi():
+def _noisy_png(tmp_path, *, size=(200, 180), noise=18.0, seed=7):
+    """带噪渐变图 —— canny 的**分辨力探针**。
+
+    Canny 取的是梯度阈值，硬边/平滑样张的梯度幅度分布太窄，改 low/high
+    几乎不动输出（实测硬边圆图 4 组全同）。加噪把幅度分布撑开后才敏感
+    （实测 137437 vs 40614 条）。凡是断言「canny 不吃某参数」的用例都
+    **必须**用这张图，否则断言没有分辨力。
+    """
+    import numpy as np
+    from PIL import Image
+
+    h, w = size
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = 120 + 60 * np.sin(xx / 18.0) * np.cos(yy / 22.0)
+    rng = np.random.default_rng(seed)
+    arr = np.clip(base + rng.normal(0, noise, (h, w)), 0, 255).astype(np.uint8)
+    p = tmp_path / "noisy.png"
+    Image.fromarray(arr).save(str(p))
+    return str(p)
+
+
+def test_canny_really_ignores_threshold_and_multi(tmp_path):
     """**B5 的前提**：canny 分支真的不读 ``threshold``/``multi``。
 
     「canny 的 spec 不写这两个字段」这条诚实性契约是**单向**依赖本用例的：
-    只要 ``_trace_image`` 的 canny 分支哪天开始读 ``threshold``，spec 就从
+    只要 :meth:`_trace_image` 的 canny 分支哪天开始读 ``threshold``，spec 就从
     「不写无效字段」悄悄翻成「**漏记生效参数**」—— 比原来更坏，而本文件里
     现有的 spec 用例**一条都不会红**（它们只断 spec 的键集合，不断
     ``_trace_image`` 到底吃不吃）。故此处把前提本身钉住。
 
-    ⚠ **两个方向都断**，否则「canny 不吃阈值」会退化成「谁都不吃阈值」：
-    同一张渐变图、同一组参数下，``center``/``outline`` **必须**随 threshold
-    变化（实测折线数 42 / 406 / 107 互不相同），canny 则**逐字节恒等**。
+    ⚠ **本用例第一版是空过的**（变异体验证时抓出来的，记在这里免得重蹈）：
+    「输出相同」在**没有分辨力**时永远为真。实测 canny 对 ``low/high`` 的
+    敏感度**强烈依赖样张**：硬边圆图上 4 组 low/high 输出全同（697 条），
+    平滑渐变图上只吐 42 条 —— 在这两种图上把 canny 改成吃 threshold，
+    本用例照样绿。故探针改用**带噪**渐变（梯度幅度分布宽），并加**两道
+    非空性对照**，任何一道失效都直接报「对照失效」而不是假装通过：
+
+    - 对照 A：同一张噪声图、同一 mode，**只改 canny 真正吃的** ``low/high``
+      ⇒ 输出**必须**不同（实测 137437 vs 40614 条）。这才让下面
+      「threshold 无影响」成为一条**有分辨力**的观察。
+    - 对照 B：在低对比渐变图上，``center``/``outline`` **必须**随 threshold
+      变化（证明 threshold 在别的模式是活参数，不是全局死参数）。
     """
     import megapro.gui.layout.layout_page as L
 
     page = L.LayoutPage()
-    src = _gradient_png(tmp_path)
+    noisy = _noisy_png(tmp_path)   # canny 在此对 low/high 高度敏感
+    grad = _gradient_png(tmp_path)  # 二值化阈值在此起作用
 
-    def traced(mode, *, threshold, use_multi=False):
+    def traced(img, mode, *, threshold=160, use_multi=False, target_mm=100.0,
+               low=50, high=120):
         return page._trace_image(
-            src, mode=mode, threshold=threshold, use_multi=use_multi,
-            target_mm=100.0, low=50, high=120)
+            img, mode=mode, threshold=threshold, use_multi=use_multi,
+            target_mm=target_mm, low=low, high=high)
 
-    canny = {th: traced("canny", threshold=th) for th in (60, 120, 200)}
-    baseline = canny[120]
+    # --- 对照 A：canny 在本探针上**确实**对自己的 low/high 敏感 -----------
+    baseline = traced(noisy, "canny")
     assert baseline, "基准本身应产出折线，否则本用例空过"
-    for th, out in canny.items():
+    assert traced(noisy, "canny", low=150, high=220) != baseline, (
+        "对照 A 失效：噪声图上 canny 换 low/high 输出都不变 —— 说明本探针对"
+        "canny 已无分辨力，下面「threshold 无影响」的断言**证明不了任何事**。"
+        "换探针（加大噪声幅度）再判，不要直接删断言。")
+
+    # --- 主张：canny 不读 threshold / use_multi ----------------------------
+    for th in (40, 160, 250):
+        out = traced(noisy, "canny", threshold=th)
         assert out == baseline, (
             f"canny 模式在 threshold={th} 上产出了不同结果 —— canny 分支"
             "竟然开始读 threshold 了。此时 canny 的 spec 必须**补回**"
             f" threshold（否则是漏记生效参数，比 B5 修的还糟）。实得折线数 "
             f"{len(out)} vs 基准 {len(baseline)}")
-    assert traced("canny", threshold=120, use_multi=True) == baseline, \
+    assert traced(noisy, "canny", use_multi=True) == baseline, \
         "canny 模式竟然开始读 use_multi 了"
 
-    # 反向对照：非 canny 模式**必须**对 threshold 敏感，否则上面等于空过
+    # --- 对照 B：threshold 在非 canny 模式是活参数 -------------------------
     for mode in ("center", "outline"):
-        outs = [traced(mode, threshold=th) for th in (60, 120, 200)]
+        outs = [traced(grad, mode, threshold=th) for th in (60, 120, 200)]
         assert len({len(o) for o in outs}) > 1, (
-            f"{mode} 模式对 threshold 毫无反应 —— 说明「canny 不吃阈值」"
-            "只是因为这张图/这条路径对谁都不吃，对照失效，换张图再判")
+            f"对照 B 失效：{mode} 模式对 threshold 毫无反应 —— 「canny 不吃"
+            "阈值」就退化成「谁都不吃阈值」的同义反复。换图再判。")
     page.deleteLater()

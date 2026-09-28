@@ -111,12 +111,40 @@ def test_handle_scale_inverts_ppm_after_zoom():
 
 
 def test_handle_screen_size_constant_across_fit():
-    """``fit()``（换页/初始布局的公共入口）同样不能让手柄漂。"""
+    """``fit()``（换页/初始布局的公共入口）同样不能让手柄漂。
+
+    ⚠ **R5 更正**：原版是「``set_zoom(ppm*2)`` 然后 ``fit()``」，而视口尺寸没变，
+    ``fit()``（``paper_view.py:112-123``）按 ``min(vr.width()/210, vr.height()/210)``
+    算 ppm ⇒ 必然回到**与 before 完全相同**的 ppm。那是一次**恒等比较**：手柄逻辑
+    怎么坏它都过（实测：修复前代码上中途漂到 20px 仍过；把 ``update_sizes`` 打成
+    完全 no-op 也过）。
+
+    真正能验 ``fit()`` 的场景是「视口尺寸变了 → fit 到**新** ppm」。故先 resize
+    视口再 fit，并前置断言结束 ppm 确实 ≠ 起始 ppm —— 没有这条前置，本用例又会
+    退回成恒等比较。
+    """
     page = _page_with_one_selected()
     before = [_screen_px(page, h) for h in _handles(page)]
-    page.view.set_zoom(page.view.px_per_mm() * 2.0, QPointF(0.0, 0.0))
-    page.view.fit()
-    assert [_screen_px(page, h) for h in _handles(page)] == pytest.approx(before)
+    assert before == pytest.approx([10.0] * len(before)), \
+        "前置：4+1 手柄各 10px（缺这条，就像 R5 指出的那样可能带着活 bug 通过）"
+
+    ppm0 = page.view.px_per_mm()
+    page.view.set_zoom(ppm0 * 2.0, QPointF(0.0, 0.0))
+    assert page.view.px_per_mm() == pytest.approx(ppm0 * 2.0), "前置：确实放大了"
+
+    # 改变视口尺寸 ⇒ fit() 会落到**不同**的 ppm
+    vp = page.view.viewport()
+    old_w, old_h = vp.width(), vp.height()
+    vp.resize(int(old_w * 1.35), int(old_h * 1.25))
+    assert (vp.width(), vp.height()) != (old_w, old_h), "前置：视口确实被改尺寸了"
+
+    ppm_after = page.view.fit()
+
+    assert abs(ppm_after - ppm0) > 1e-6, (
+        f"前置失败：fit() 后 ppm={ppm_after} 与起始 {ppm0} 相同 ⇒ "
+        "本用例退化成恒等比较，验不到任何东西")
+    assert [_screen_px(page, h) for h in _handles(page)] == pytest.approx(before), \
+        f"fit() 到新 ppm={ppm_after} 后手柄屏幕尺寸漂了"
     page.deleteLater()
 
 
@@ -166,11 +194,72 @@ def test_pan_does_not_recompute_handle_sizes():
 
 
 def test_no_selection_zoom_is_noop_and_safe():
-    """无选中时缩放不得崩、也不该做无谓工作（手柄数为 0）。"""
+    """无选中时缩放：不得崩、不得凭空长出手柄，且**缩放流水线必须仍然走到**。
+
+    ⚠ **R5 更正**：原版只断言「前后手柄数都是 0」，而**修复前也成立**（B1 前
+    ``viewChanged`` 压根没接手柄），故钉不住任何东西。
+
+    补的前置断言是「缩放确实走到了 ``update_sizes``」。这**不是**在测实现细节，
+    而是在守一条契约：空选中集时 ``update_sizes`` 走的是一个**空循环**（对任何
+    手柄都不操作 = 「无谓工作」仍然是 0），但**整条路径不能被短路**。否则将来谁
+    在 ``_on_view_changed`` 开头加一句 ``if not self._handles: return`` 当
+    「优化」，缩放就会静默回到 B1 之前的状态 —— 而所有其它用例当时仍然绿。
+    """
     import megapro.gui.layout.layout_page as L
 
     page = L.LayoutPage()
-    assert page._handles._handles == []
+    sh = page._handles
+    assert sh._handles == [], "前置：初始无选中 ⇒ 无手柄"
+
+    calls = []
+    original = sh.update_sizes
+
+    def spy():
+        calls.append(1)
+        original()
+
+    sh.update_sizes = spy
     page.view.set_zoom(page.view.px_per_mm() * 3.0, QPointF(1.0, 1.0))
-    assert page._handles._handles == []
+    del sh.update_sizes
+
+    assert sh._handles == [], "无选中时缩放不该凭空长出手柄"
+    assert calls, ("缩放没有走到 update_sizes —— 若将来给空选中集加「早退优化」，"
+                   "缩放路径会静默失效，而本文件其它用例那时仍会全绿")
+    page.deleteLater()
+
+
+# --- 事件级：真实 wheelEvent 才是用户实际触发的那条路 -------------------------
+
+def test_real_wheel_event_resizes_handles():
+    """真发 ``QWheelEvent`` 进 viewport ⇒ 手柄屏幕尺寸仍恒定。
+
+    B1 的整个论证是「``_apply_transform`` 是缩放的**唯一**汇流点，``viewChanged``
+    在那里发」——而那 6 条用例全都直接调 ``set_zoom()``/``fit()``/``pan_by()``，
+    **没有一条走真实滚轮**，等于这条前提本身没有回归保护。本条补上。
+
+    复现要点：``wheelEvent``（``paper_view.py:140-144``）算 ``factor`` 后调
+    ``set_zoom``，所以必须真的把事件投进 viewport，绕不过去。
+    """
+    from PySide6 import QtCore, QtGui
+
+    page = _page_with_one_selected()
+    before = [_screen_px(page, h) for h in _handles(page)]
+    assert before == pytest.approx([10.0] * len(before)), "前置：4+1 手柄各 10px"
+    ppm0 = page.view.px_per_mm()
+
+    vp = page.view.viewport()
+    for _ in range(2):
+        ev = QtGui.QWheelEvent(
+            QtCore.QPointF(40.0, 40.0), QtCore.QPointF(40.0, 40.0),
+            QtCore.QPoint(0, 0), QtCore.QPoint(0, 120),
+            QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
+            QtCore.Qt.NoScrollPhase, False)
+        QApplication.sendEvent(vp, ev)
+
+    assert page.view.px_per_mm() != pytest.approx(ppm0), \
+        "前置失败：真实滚轮没改变 ppm ⇒ 本用例什么都没验"
+    assert [_screen_px(page, h) for h in _handles(page)] == pytest.approx(before), \
+        "真实滚轮缩放后手柄屏幕尺寸漂了"
+    assert _rotate_gap_screen_px(page) == pytest.approx(18.0, abs=1e-6), \
+        "真实滚轮缩放后旋转手柄的屏幕间距漂了"
     page.deleteLater()

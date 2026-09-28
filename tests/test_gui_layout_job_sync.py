@@ -308,10 +308,18 @@ def test_layout_edits_emit_job_sync_each():
     lp._gi_for(it).setSelected(True)          # 删除目标显式勾上，不靠上一个动作
     step(lp._delete_selected, "删除")
 
-    # 对照：页切换仍要发
+    # 对照：页切换仍要发。**两个**页操作都作对照（R6）：原版只挑了
+    # ``_on_page_add`` —— 而它恰是三个页操作里**唯一能过**的那个（``add_page``
+    # 不碰 ``doc.current``，页签信号会真发）。``_on_page_del`` 是删当前页：
+    # ``remove_page`` 先把 current 挪好，页签信号恒为 no-op，修复前 0 次同步。
     n = len(seen)
     lp._on_page_add()
-    assert len(seen) == n + 1, "页切换仍应发一次同步"
+    assert len(seen) == n + 1, "页切换（加页）仍应发一次同步"
+
+    n = len(seen)
+    lp._on_page_del()                      # 删当前页
+    assert len(seen) == n + 1, \
+        "页切换（删当前页）应发一次同步 —— 该操作不碰页签信号，只能自己发"
     w.close()
 
 
@@ -339,7 +347,92 @@ def test_layout_edits_do_not_emit_job_sync_when_switch_off():
     lp._delete_selected()
     assert seen == [], f"开关关时编辑仍发了同步，实际 {len(seen)} 次"
 
-    # 开关关时页切换同样不发（同一口径）
+    # 开关关时页切换同样不发（同一口径）。R6：两个页操作都验 —— 原版只验
+    # ``_on_page_add``，漏了删当前页那条（它修复前压根不经过开关判断，因为
+    # 压根没发信号；修复后若忘了接开关，这里会红）。
     lp._on_page_add()
     assert seen == [], f"开关关时页切换仍发了同步，实际 {len(seen)} 次"
+    lp._on_page_del()
+    assert seen == [], f"开关关时删页仍发了同步，实际 {len(seen)} 次"
+    w.close()
+
+
+# --- R6：删当前页必须让作业页跟着换页（会切错东西的那一类） -------------------
+
+def test_delete_current_page_resyncs_job_to_surviving_page():
+    """删**当前页** ⇒ 作业页必须换成存活页的几何（``_job_spec``/``_job_lines``）。
+
+    R6 缺陷实测：两页时停在第 1 页点「－」，``remove_page`` 先把 ``doc.current``
+    挪到 0，``_refresh_page_bar`` 又在 ``blockSignals(True)`` 里把页签索引改好 ⇒
+    QTabBar **一次信号都不发** ⇒ ``_on_page_tab_changed`` 整段不执行 ⇒ **0 次
+    同步**。结果画布已是第 0 页、作业页仍握**已删页**几何、run 门禁全绿、控制台
+    一行不打，机器会收到已删页那条对角线。
+
+    本例直接断言**机器后果**（作业页坐标 / 将发送的 lines），不只数信号次数 ——
+    上一轮栽过的坑就是「断言了会变的量」。几何范围可区分：第 0 页 x∈0..10、
+    第 1 页 x∈100..140。
+    """
+    from megapro.gui.layout.model import Item, flatten_visible
+
+    w = _make_window()
+    lp = w.layout_page
+
+    # 两页：P0(x 0..10) / P1(x 100..140)，并让作业页握第 1 页
+    lp._sync_job_cb.setChecked(False)                 # 造页阶段关掉，避免干扰
+    lp._add_items([Item(paths=[list(p) for p in _P0], name="p0")])
+    lp._on_page_add()
+    lp._add_items([Item(paths=[list(p) for p in _P1], name="p1")])
+    lp._page_bar.setCurrentIndex(0)
+    lp._on_export()                                   # 作业页 = 第 0 页
+    lp._sync_job_cb.setChecked(True)                  # ← 必须在切页**之前**开
+    lp._page_bar.setCurrentIndex(1)                   # 静默同步到第 1 页
+    assert [list(p) for p in w._job_spec.paths_paper] == [list(p) for p in _P1], \
+        "前置：作业页应已同步到第 1 页"
+    lines_p1 = list(w._job_lines)
+    assert any("X100" in l for l in lines_p1), f"前置：将发送的 lines 应含第 1 页坐标：{lines_p1}"
+
+    lp._on_page_del()                                 # ← 删**当前**页（第 1 页）
+
+    assert lp.doc.current == 0, "前置：删第 1 页后 current 应落到第 0 页"
+    assert [list(p) for p in w._job_spec.paths_paper] == [list(p) for p in _P0], \
+        (f"作业页仍握已删页几何：{[list(p) for p in w._job_spec.paths_paper]}")
+    assert w._job_lines != lines_p1, "删页后 lines 未重编译（仍是已删页）"
+    assert [list(p) for p in w._job_spec.paths_paper] == flatten_visible(lp.doc), \
+        "作业页几何与当前页不一致"
+    assert not any("X140" in l for l in w._job_lines), \
+        f"已删页的坐标仍留在将发送的 lines 里（会切到已删内容）：{w._job_lines}"
+    w.close()
+
+
+def test_move_page_resyncs_job_to_current_page():
+    """页重排（``_on_page_right``）同样自己发同步（``move_page`` 会改 current）。
+
+    与删页同因：``_refresh_page_bar`` 已把页签索引改好 ⇒ 这次 ``setCurrentIndex``
+    不发信号 ⇒ 页签那条同步路径恒为 no-op（修复前实测 emits=0）。
+
+    ⚠ 断言的是**不变量**而非「作业页变成第几页」：``move_page`` 是把**当前页整体
+    挪位置**，当前页的**内容**不变（重排后 ``current=1`` 那一页装的仍是 P0）。
+    所以正确期望是「作业页 == 当前页几何」，而不是硬写 P1 —— 我第一版硬写 P1，
+    写完就红，是我的期望错了、不是实现错了。
+    """
+    from megapro.gui.layout.model import Item, flatten_visible
+
+    w = _make_window()
+    lp = w.layout_page
+    lp._sync_job_cb.setChecked(False)
+    lp._add_items([Item(paths=[list(p) for p in _P0], name="p0")])
+    lp._on_page_add()
+    lp._add_items([Item(paths=[list(p) for p in _P1], name="p1")])
+    lp._page_bar.setCurrentIndex(0)
+    lp._on_export()
+    lp._sync_job_cb.setChecked(True)
+    assert [list(p) for p in w._job_spec.paths_paper] == [list(p) for p in _P0]
+
+    seen = _emit_counter(lp)
+    lp._on_page_right()                               # 把第 0 页右移 ⇒ current=1
+
+    assert lp.doc.current == 1, "前置：重排后 current 应为 1"
+    assert len(seen) == 1, f"页重排应发一次同步，实际 {len(seen)} 次"
+    assert [list(p) for p in w._job_spec.paths_paper] == flatten_visible(lp.doc), \
+        "页重排后作业页几何与当前页不一致"
     w.close()

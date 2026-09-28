@@ -709,6 +709,12 @@ class LayoutPage(QtWidgets.QWidget):
         self.job_sync_requested.emit(self.to_job_spec())
 
     def _on_page_add(self) -> None:
+        # R6 注：本操作**故意不**自己发同步。``add_page`` 不碰 ``doc.current``，
+        # 故下面那次 ``setCurrentIndex(idx)`` 是真的换索引 → QTabBar 发信号 →
+        # ``_on_page_tab_changed`` 已经发过一次同步（实测 emits=1）。在这里再发
+        # 一次会变成 2，把 C2 的 ``test_layout_edits_emit_job_sync_each`` 打红。
+        # 真正需要自己发的是 :meth:`_on_page_del` 与 :meth:`_move_page`（它们会改
+        # current，页签信号恒为 no-op）。见 :meth:`_on_page_del` 的 R6 说明。
         idx = self.doc.add_page(at=self.doc.current + 1)
         self._refresh_page_bar()
         self._page_bar.setCurrentIndex(idx)
@@ -723,6 +729,16 @@ class LayoutPage(QtWidgets.QWidget):
         self._page_bar.setCurrentIndex(self.doc.current)
         self._rebuild_scene()
         self._after_change()
+        # R6：删页**必须**自己发同步，不能指望页签信号。
+        # ``remove_page``（model.py:1149-1162）先把 ``doc.current`` 挪好，于是
+        # ``_refresh_page_bar`` 在 ``blockSignals(True)`` 里就把页签索引改成了
+        # 新的 current ⇒ 紧接着这次 ``setCurrentIndex`` 索引没变、QTabBar **一次
+        # 信号都不发** ⇒ ``_on_page_tab_changed`` 整段不执行 ⇒ 0 次同步。
+        # 后果（实测）：两页时停在第 1 页点「－」，画布当场换成第 0 页，而作业页
+        # 仍握着**已删页**几何，run 门禁全绿、控制台一行不打，机器会收到已删页
+        # 那条对角线（``G1 X140 Y140``）—— 这是会切错东西的那一类。
+        # 与 ``_on_page_tab_changed``（:632-636）同一顺序：重建 → 刷新 → 同步。
+        self._maybe_emit_job_sync()
 
     def _on_page_dup(self) -> None:
         idx = self.doc.duplicate_page()
@@ -740,13 +756,20 @@ class LayoutPage(QtWidgets.QWidget):
         self._move_page(self.doc.current + 1)
 
     def _move_page(self, to: int) -> None:
-        """页重排：模型层改序后**重挂当前页**（页内容随之移动，场景全量重建）。"""
+        """页重排：模型层改序后**重挂当前页**（页内容随之移动，场景全量重建）。
+
+        R6：同 :meth:`_on_page_del`，``move_page`` 会改 ``doc.current``，
+        ``_refresh_page_bar`` 已在 ``blockSignals`` 里把页签索引改好 ⇒ 这次
+        ``setCurrentIndex`` 不发信号 ⇒ 页签那条同步路径恒为 no-op（实测
+        ``_on_page_right()`` emits=0）。故此处必须自己发一次。
+        """
         if not self.doc.move_page(self.doc.current, to):
             return
         self._refresh_page_bar()
         self._page_bar.setCurrentIndex(self.doc.current)
         self._rebuild_scene()
         self._after_change()
+        self._maybe_emit_job_sync()
 
     def _rebuild_scene(self) -> None:
         """场景全量重建 = 清场景 → 按当前页逐叶子 ``make_gi``（FR-09 页切换）。

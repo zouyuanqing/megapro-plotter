@@ -398,6 +398,15 @@ class DetachInfo:
     ``owner`` = 原 owning container（顶层图元为 ``None``）；``index`` = 在
     ``owner.children``（或顶层 ``items``）中的原下标。undo 侧调
     :meth:`Document.attach` 即可原样复原，避免「叶子变顶层项、组被静默解散」。
+
+    ⚠ **``index`` 是「本次删除前、已删项塌陷之后」的位置，不是原列表下标**
+    （A3 修的就是这一条）。一次删多项时回执逐个产生，后面的下标已被前面的
+    删除压过 ⇒ 脱离上下文单独使用必然错位。消费方**必须逆删除序**回插
+    （见 :class:`~megapro.gui.canvas.undo_cmds.RemoveItemsCommand._do_undo`
+    的论证）：轮到某项时列表已还原成「原列表 − 更早被摘的那些」，与它被摘下
+    那一刻的列表相同，故该下标恰好是它的正确落点。正序回插则得到原顺序的一
+    个置换 —— 几何条数不变、画布看不出来，但 ``document_to_svg`` 与删除前
+    **逐字节**不同 ⇒ 送作业的切割次序变了。
     """
 
     owner: Item | None

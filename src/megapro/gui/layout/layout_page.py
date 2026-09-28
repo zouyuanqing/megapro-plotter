@@ -184,6 +184,9 @@ def _union_bbox(boxes) -> tuple[float, float, float, float]:
 # 契约：容器**连子树**一起序列化/克隆（``children`` 键），叶子格式与既有平面
 # JSON **逐字段兼容**（``paths``/``pos``/``scale``/``angle_deg``/``name``/``z``/
 # ``text_spec``）—— 旧剪贴板内容仍可粘贴。``visible``/``locked`` 一并带走。
+# ``mirror_x``/``mirror_y`` **同样必须带走**：镜像是读取时施加的标志（不在
+# ``paths`` 里），漏了它就不是「少个字段」而是**副本几何整个反了**（镜像件
+# 被还原成未镜像件，错误坐标直达机器，全程不抛错）。
 # 组内相对布局在粘贴后保持（各子项 pos 相对不变，只对**容器根**加偏移），
 # 故偏移只施加在根，不逐层累加（逐层会双重偏移）。
 
@@ -192,7 +195,8 @@ def _item_to_json(item: Item) -> dict:
     d = {"paths": item.paths, "pos": item.pos, "scale": item.scale,
          "angle_deg": item.angle_deg, "name": item.name, "z": item.z,
          "text_spec": item.text_spec, "image_spec": item.image_spec,
-         "visible": item.visible, "locked": item.locked}
+         "visible": item.visible, "locked": item.locked,
+         "mirror_x": bool(item.mirror_x), "mirror_y": bool(item.mirror_y)}
     if item.children:
         d["children"] = [_item_to_json(ch) for ch in item.children]
     return d
@@ -204,6 +208,7 @@ def _item_from_json(d: dict, *, dz: float, z: float) -> Item:
     根的 z 强制取 ``z``（副本/粘贴须落在新最上层 —— 与既有平面 JSON 的
     ``z=top_z+1`` 行为逐位一致）；子项各自保留**序列化的原 z**（组内相对
     层序保持）。偏移只加根不逐层累加（逐层会双重偏移）。
+    ``mirror_*`` 缺键（旧剪贴板内容）默认 False —— 旧内容本就无镜像概念。
     """
     pos = d.get("pos", (0.0, 0.0))
     kids = [_item_from_json(c, dz=0.0, z=float(c.get("z", 0.0)))
@@ -218,6 +223,8 @@ def _item_from_json(d: dict, *, dz: float, z: float) -> Item:
         z=float(z),
         visible=bool(d.get("visible", True)),
         locked=bool(d.get("locked", False)),
+        mirror_x=bool(d.get("mirror_x", False)),
+        mirror_y=bool(d.get("mirror_y", False)),
         text_spec=copy.deepcopy(d.get("text_spec")),
         image_spec=copy.deepcopy(d.get("image_spec")),
         children=kids,
@@ -706,10 +713,18 @@ class LayoutPage(QtWidgets.QWidget):
             b.setAutoRaise(True)
             tb.addWidget(b)
         tb.addSeparator()
-        # 镜像（FR-08，贴纸转印）
-        for label, fn in (("水平镜像", lambda: self._toggle_mirror("h")),
-                          ("垂直镜像", lambda: self._toggle_mirror("v"))):
-            add_btn(label, fn)
+        # 镜像（FR-08，贴纸转印）。**checkable**：勾选态即「当前选中项处于镜像
+        # 态」，由 :meth:`_refresh_mirror_buttons` 按模型真值回写。
+        self.btn_mirror: dict[str, QtWidgets.QToolButton] = {}
+        for label, axis in (("水平镜像", "h"), ("垂直镜像", "v")):
+            # `_checked=False` 占位：QToolButton.clicked 带 bool 参数，PySide6
+            # 会按可调用对象形参个数实参化 —— 只写 `lambda a=axis: …` 的话那个
+            # bool 会顶掉默认的 axis（axis 变成 True/False，镜像轴串台）。
+            b = add_btn(label,
+                        lambda _checked=False, a=axis: self._toggle_mirror(a),
+                        checkable=True)
+            b.setToolTip(f"{label}（勾选 = 当前选中项处于该镜像态）")
+            self.btn_mirror[axis] = b
         tb.addSeparator()
         # 编组/解组（FR-03）
         for label, fn in (("编组", self.group_selected),
@@ -757,6 +772,14 @@ class LayoutPage(QtWidgets.QWidget):
         self.sp_scale.valueChanged.connect(self._apply_props)
         self.sp_scale.editingFinished.connect(self._end_prop_gesture)
         props.addWidget(self.sp_scale)
+        # 镜像状态**只读**指示（FR-08）：镜像是读取时施加的标志，属性栏里看不到
+        # 就等于「切了但不知道切没切」。这里只显示不编辑 —— 切换入口仍是工具条
+        # 的两个镜像按钮（免得多一条编辑路径要各自接可撤销命令/手势 token）。
+        props.addWidget(QtWidgets.QLabel("镜像:"))
+        self.lb_mirror = QtWidgets.QLabel("无")
+        self.lb_mirror.setMinimumWidth(56)
+        self.lb_mirror.setToolTip("当前选中图元的镜像状态（只读；切换用工具条的镜像按钮）")
+        props.addWidget(self.lb_mirror)
         props.addStretch(1)
         self.btn_save = QtWidgets.QPushButton("另存为 SVG…")
         self.btn_save.clicked.connect(self._on_save_svg)
@@ -822,6 +845,9 @@ class LayoutPage(QtWidgets.QWidget):
 
     def _refresh_props(self) -> None:
         sel = self._selected()
+        # 镜像按钮/指示器同源于选中项（早于两个分支，故无选中也会刷新）
+        self._refresh_mirror_buttons()
+        self._refresh_mirror_label(sel)
         spins = (self.sp_x, self.sp_y, self.sp_w, self.sp_h, self.sp_ang,
                  self.sp_scale)
         if not sel:
@@ -853,6 +879,30 @@ class LayoutPage(QtWidgets.QWidget):
         self.sp_scale.setValue(it.scale)
         for s in spins:
             s.blockSignals(False)
+
+    def _refresh_mirror_label(self, sel: list) -> None:
+        """属性栏的镜像状态**只读**指示：多选按「全同 / 混合」口径显示。"""
+        if not sel:
+            self.lb_mirror.setText("无")
+            self.lb_mirror.setEnabled(False)
+            return
+        self.lb_mirror.setEnabled(True)
+        if len(sel) == 1:
+            it = sel[0].model_item
+            texts = {(True, False): "水平", (False, True): "垂直",
+                     (True, True): "水平+垂直", (False, False): "无"}
+            self.lb_mirror.setText(texts[(bool(it.mirror_x), bool(it.mirror_y))])
+            return
+        all_x = all(gi.model_item.mirror_x for gi in sel)
+        all_y = all(gi.model_item.mirror_y for gi in sel)
+        if all_x and all_y:
+            self.lb_mirror.setText("水平+垂直")
+        elif all_x:
+            self.lb_mirror.setText("水平")
+        elif all_y:
+            self.lb_mirror.setText("垂直")
+        else:
+            self.lb_mirror.setText("混合")
 
     def _apply_props(self) -> None:
         """数值定位（根因 #10）：按改动字段分派，全部走可撤销命令。"""
@@ -1097,10 +1147,16 @@ class LayoutPage(QtWidgets.QWidget):
 
         多选时取**全部选中项当前值的反值**中的一致方向：全 False → 置 True，
         全 True → 置 False，混合 → 置 True（收敛到统一，便于再点一次归零）。
+        按钮的勾选态与之**同口径**（全选中项皆该态才算勾上，见
+        :meth:`_refresh_mirror_buttons`），故「点一下」永远等于「切到未勾」。
+
+        未选中图元时**不静默**：按钮已被 Qt 翻转的勾选态先回滚，再给中文提示。
         """
         field = "mirror_x" if axis == "h" else "mirror_y"
         sel = self._selected()
         if not sel:
+            self._refresh_mirror_buttons()  # 撤掉 Qt 的自动翻转（无选中=全 False）
+            self.status_message.emit("未选中图元：请先选中要镜像的图元")
             return
         cur = [getattr(gi.model_item, field) for gi in sel]
         new = not all(cur)
@@ -1114,6 +1170,28 @@ class LayoutPage(QtWidgets.QWidget):
             self._undo.push(ChangeItemPropsCommand(
                 self, changes, "水平镜像" if axis == "h" else "垂直镜像"))
         self._after_change()
+
+    def _refresh_mirror_buttons(self) -> None:
+        """两个镜像按钮的勾选态 ← **模型真值**（当前选中项的镜像标志）。
+
+        ``checkable`` 的 QToolButton 被点击时 Qt 会**自己**翻转勾选态，所以每次
+        刷新都必须按真值回写，否则会出现「点了没选中、按钮却亮着」「镜像被撤销
+        了、按钮还亮着」这类假状态。
+
+        多选口径与 :meth:`_toggle_mirror` 的下一状态一致：**全部**选中项都处于
+        该镜像态才算勾上（全 True → 下一次点击是取消；混合/全 False → 下一次
+        点击是置 True）。
+        """
+        sel = self._selected()
+        for axis, btn in getattr(self, "btn_mirror", {}).items():
+            field = "mirror_x" if axis == "h" else "mirror_y"
+            if not sel:
+                on = False
+            elif len(sel) == 1:
+                on = bool(getattr(sel[0].model_item, field))
+            else:
+                on = all(getattr(gi.model_item, field) for gi in sel)
+            btn.setChecked(on)
 
     # -- 层序 / 对齐 / 分布 -------------------------------------------------
 

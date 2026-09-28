@@ -242,6 +242,13 @@ class RemoveItemsCommand(_PageCommand):
     走 ``doc.add`` 把叶子挂成顶层项、**组被静默解散**（无异常、几何还看得见，
     用户更不易察觉）。``DetachInfo`` 缺失的成员（redo 前就不在文档里）退回
     ``doc.add``。
+
+    **回执必须逆删除序使用**（A3）：一次删 ≥2 项时，``DetachInfo.index`` 是
+    「本次删除前、**已删项塌陷之后**」的下标，脱离上下文单独用就是错的。
+    正序回插得到的是原顺序的一个**置换**（几何集合与条数都不变、画布上看
+    不出来，但 ``document_to_svg`` 与删除前逐字节不同 ⇒ 送作业的 G-code 行
+    多重集相同而有序不同，切纸机按另一条顺序走刀）。见 :meth:`_do_undo`
+    的完整论证。
     """
 
     def __init__(self, page, items: list[Item], text: str = "删除"):
@@ -262,7 +269,20 @@ class RemoveItemsCommand(_PageCommand):
         self._run(self._do_undo)
 
     def _do_undo(self) -> None:
-        for it, info in zip(self.items, self._infos):
+        # **必须逆删除序回插**（A3）。``DetachInfo.index`` 记的是「r_t 被摘下
+        # 那一刻它所在的下标」，那一刻的列表 = 原列表 − {已摘的 r_1..r_{t-1}}。
+        # 正序回插时更早的成员还没就位，列表少了 r_1..r_{t-1} 之外的东西 ——
+        # 于是每个下标都错位，整体变成原顺序的一个**置换**。实跑：三个顶层
+        # 散件 p,q,r 一次删除后撤销 → ['r','q','p']（完全反转，而
+        # 「多选 → Ctrl+D → Ctrl+Z」是最常规操作）；非相邻的 2、4 →
+        # ['1','2','4','3']；跨组时 ``G.children`` 从 ['a','b'] 变 ['b','a']。
+        # 逆序回插则逐项正确：轮到 r_t 时列表已是「原列表 − {r_1..r_{t-1}}」
+        # （r_t..r_k 都已就位），与记录那一刻**完全相同** ⇒ 该下标就是 r_t 的
+        # 正确落点。逐 owner 独立成立，故跨组/跨两个组一并覆盖。
+        #
+        # 与入参顺序**无关**（``_delete_selected`` 传的是**场景选择顺序**，
+        # 不必等于文档顺序）—— 上面的论证对任意删除次序都成立。
+        for it, info in zip(reversed(self.items), reversed(self._infos)):
             if info is not None:
                 self.page.doc.attach(it, owner=info.owner, index=info.index)
             for leaf in iter_leaves([it]):
@@ -481,7 +501,11 @@ class ClearCommand(_PageCommand):
         self._run(self._do_undo)
 
     def _do_undo(self) -> None:
-        for it, info in zip(self.saved, self._infos):
+        # **逆删除序回插**，理由与 :meth:`RemoveItemsCommand._do_undo` 逐字相同
+        # （A3）：``saved`` 逐个摘除时记下的 index 是「已摘项塌陷之后」的位置，
+        # 正序回插 ⇒ 原顺序的置换。实跑：顶层 ['组','z'] 清空后撤销变成
+        # ['z','组']。
+        for it, info in zip(reversed(self.saved), reversed(self._infos)):
             if info is not None:
                 self.page.doc.attach(it, owner=info.owner, index=info.index)
             for leaf in iter_leaves([it]):

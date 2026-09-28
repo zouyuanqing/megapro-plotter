@@ -612,6 +612,14 @@ class Page:
         返回被提升的子项列表（原顺序）；容器不是本树的容器 / 本身不持有子项
         时返回空列表并**不动模型**。容器被摘出后其 ``children`` 清空（它不再是
         组）。几何**逐位不变**（提升不碰任何成员字段）。
+
+        ⚠ **本方法对容器是破坏性的，undo 侧必须自己复原 children**
+        （A2 修的就是这条）。清空 ``container.children`` 是设计如此（摘出来
+        之后它已不是组），但这意味着**光把容器 ``attach`` 回去并不能撤销解
+        组** —— 那是「空组 + 孩子全被提为顶层」的错误结构（顶层多一个无子项
+        幽灵容器）。要撤销必须按 **摘孩子 → 挂回 children → 挂容器** 三步，
+        见 :class:`~megapro.gui.canvas.undo_cmds.UngroupCommand`（孩子快照
+        取自本方法的返回值）。故本方法**返回 kids** 不是可选项而是契约。
         """
         if not container.is_container():
             return []

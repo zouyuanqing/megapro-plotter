@@ -252,6 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.layout_page = LayoutPage()
         self.layout_page.export_requested.connect(self._on_layout_export)
+        self.layout_page.job_sync_requested.connect(self._on_layout_job_sync)
         self.layout_page.status_message.connect(self._append_console)
         self.tabs.addTab(self.layout_page, "排版 / 制作")
         root.addWidget(self.tabs, 1)
@@ -1541,6 +1542,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._recompile()
         self.tabs.setCurrentIndex(0)
         self._append_console("排版已送去作业页 —— 检查预览后点『开始执行』")
+
+    def _on_layout_job_sync(self, spec) -> None:
+        """排版页**静默**同步作业预览（页切换等轻量动作，PRD §10.1-8）。
+
+        与 :meth:`_on_layout_export` 逐行同源（赋值 → placement 投影 →
+        ``_recompile``），差别只有两处：**不切标签页、不打控制台** —— 页切换
+        是高频动作，把用户踢回控制页并刷屏不可接受。
+
+        ``_recompile`` 的触发集只是**新增**这一个点，既有触发点与语义一律
+        未改：这里没有另开编译路径（执行中仍 no-op + 提示、无作业仍提前返回、
+        参数仍由 ``_spec_with_current_params`` 投影）。
+        """
+        if not isinstance(spec, JobSpec):
+            return
+        self._job_spec = spec
+        self._set_placement_ui(spec.placement.mode)
+        self._recompile()
 
     def _on_clear_job(self) -> None:
         self._job_spec = None

@@ -238,6 +238,10 @@ class LayoutPage(QtWidgets.QWidget):
     """
 
     export_requested = QtCore.Signal(object)  # JobSpec（纯逻辑对象）
+    #: 排版页**静默**同步作业预览（JobSpec）——与 export_requested 的区别只在
+    #: 消费侧：那个 handler 会 setCurrentIndex(0) 把用户踢回控制页并刷控制台，
+    #: 页切换这种高频轻量动作不能走它（PRD §10.1-8 多页切换同步作业预览）。
+    job_sync_requested = QtCore.Signal(object)
     status_message = QtCore.Signal(str)
 
     def __init__(self, parent=None) -> None:
@@ -531,10 +535,11 @@ class LayoutPage(QtWidgets.QWidget):
         root.addWidget(self._build_props())
 
     def _build_page_bar(self) -> QtWidgets.QWidget:
-        """页签条（FR-09）：页签 + 增/删/复制/左移/右移。
+        """页签条（FR-09）：页签 + 增/删/复制/左移/右移 + 作业预览同步开关。
 
         页签是 ``QTabBar``（点即切换；**不要**用 QTabWidget 的页面栈 ——
         场景是**一个**扁平场景，页切换靠 :meth:`_rebuild_scene`，不是换 QWidget）。
+        同步开关与页签同属「页行为」，故并排放在同一行。
         """
         bar = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(bar)
@@ -550,6 +555,14 @@ class LayoutPage(QtWidgets.QWidget):
             b.setFixedWidth(52 if len(text) > 1 else 30)
             b.clicked.connect(fn)
             row.addWidget(b)
+        # 页切换同步作业预览（PRD §10.1-8）。默认**开** —— 本来就要同步，做成
+        # 可选是让步；关掉即退回「只有点『送去作业』才刷新」的老行为。
+        self._sync_job_cb = QtWidgets.QCheckBox("同步作业预览", bar)
+        self._sync_job_cb.setChecked(True)
+        self._sync_job_cb.setToolTip(
+            "切页后把当前页版面静默同步到作业页（不切页、不刷控制台）；\n"
+            "关闭后切页不再刷新作业页，需要手动点『送去作业』。")
+        row.addWidget(self._sync_job_cb)
         return bar
 
     def _refresh_page_bar(self) -> None:
@@ -573,6 +586,22 @@ class LayoutPage(QtWidgets.QWidget):
         if self.doc.switch_page(index):
             self._rebuild_scene()
             self._after_change()
+            self._maybe_emit_job_sync()
+
+    def _maybe_emit_job_sync(self) -> None:
+        """当前页**确实切换**后，按开关把版面静默同步到作业页（PRD §10.1-8）。
+
+        走 :attr:`job_sync_requested` 而非 :attr:`export_requested`：后者在
+        MainWindow 侧会 ``setCurrentIndex(0)`` 把用户踢出排版页并刷一行控制台，
+        而页切换是高频轻量动作。开关默认开，勾选状态读 :attr:`_sync_job_cb`。
+
+        ⚠ 范围：只接**页切换**这一个触发点。镜像/移动/增/删等编辑是否也同步
+        作业预览是尚未拍板的产品决定，故 ``_after_change`` 链**不**发本信号。
+        """
+        cb = getattr(self, "_sync_job_cb", None)
+        if cb is not None and not cb.isChecked():
+            return
+        self.job_sync_requested.emit(self.to_job_spec())
 
     def _on_page_add(self) -> None:
         idx = self.doc.add_page(at=self.doc.current + 1)

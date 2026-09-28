@@ -534,8 +534,26 @@ class GroupCommand(_PageCommand):
 class UngroupCommand(_PageCommand):
     """解组（FR-03/T3 + FR-04/T4）：容器摘除、子项原地提升，几何逐位不变。
 
-    redo 时记下容器的**原归属**（owner 容器 + 下标），undo 据此原位挂回 ——
-    解组后再编组才回到同一层序（否则组会被追加到顶层末尾）。
+    **undo 把组完整复原**（FR-03 的 undo 强契约）。:meth:`Document.ungroup` 是
+    **破坏性**的：把 children 原地提升后 ``container.children = []``（"它不再是
+    组"）⇒ 那个容器对象在 undo 之前是**空壳**。旧 ``_do_undo`` 开头一句
+    ``if not self.container.children: return`` 于是让**每次撤销都在这里返回**
+    —— 本 docstring 曾声称的"undo 据此原位挂回"从未实现。实测：真实窗口路径
+    按一次 Ctrl+Z，index 3→2、undoText 已变成「编组」，但顶层仍是
+    ``['a','b']``、组没回来（monkeypatch 数 ``Page.attach`` 调用次数 3→3
+    **零增长** ⇒ 那行 attach 是死代码）；第二次撤销撤 :class:`GroupCommand`
+    时操作的也是这个空壳容器，同样空转 —— 用户要按三次才见到第一次真实效果。
+
+    **复原顺序不可颠倒：先摘孩子 → 挂回 children → 挂容器**。只把空容器
+    ``attach`` 回去得到「空组 + 孩子全被提为顶层」—— 顶层凭空多一个无子项的
+    幽灵容器（实测 ``items=['G','a','b']`` 而 ``G.children=[]``）；只补 children
+    而不先摘除孩子，则它们**同时**留在顶层和容器里 ⇒ 同一几何被拍平两次 =
+    切纸机切两遍。故 :meth:`_do_undo` 严格按上述三步。
+
+    归属（owner 容器 + 下标）**每次 redo 都重新读**（:meth:`owner_of` +
+    :meth:`_slot`）：undo 已把容器放回原位，重读得到的就是原位。旧实现用
+    ``if self._owner is None and self._index is None`` 判「首次」，而顶层容器
+    恰好 ``_owner is None``，第二次 redo 只因 ``_index`` 非 None 才偶然成立。
     """
 
     def __init__(self, page, container: Item, text: str = "解组"):
@@ -543,6 +561,9 @@ class UngroupCommand(_PageCommand):
         self.container = container
         self._owner: Item | None = None
         self._index: int | None = None
+        #: redo 从 :meth:`Document.ungroup` 收回来的孩子快照 —— undo 复原
+        #: children 的**唯一**依据（容器自身已被清空，问它问不出来）。
+        self._kids: list[Item] = []
 
     def _after_ungroup(self, kids: list[Item]) -> None:
         for leaf in iter_leaves(kids):
@@ -552,10 +573,15 @@ class UngroupCommand(_PageCommand):
         self._run(self._do_redo)
 
     def _do_redo(self) -> None:
-        if self._owner is None and self._index is None:
-            self._owner = self.page.doc.owner_of(self.container)
+        # 归属每次重读：undo 已把容器放回原 owner/下标，重读即原位。
+        self._owner = self.page.doc.owner_of(self.container)
         self._index = self._slot()
         kids = self.page.doc.ungroup(self.container)
+        if kids:
+            # 只在真解组成功时更新快照。ungroup 返回 []（容器已非容器 / 不在
+            # 文档里）时保留上一次的记录，undo 仍能复原 —— 否则一次失败的
+            # redo 会把 undo 的依据清空，又变成静默空操作。
+            self._kids = list(kids)
         self._after_ungroup(kids)
         self.page._after_change()
 
@@ -575,9 +601,18 @@ class UngroupCommand(_PageCommand):
         self._run(self._do_undo)
 
     def _do_undo(self) -> None:
-        if not self.container.children:
-            # 已被别处清空（不应发生）—— 防御：不产生错误结构
+        if not self._kids:
+            # 从未 redo 成功过（无孩子可复原）—— 防御：不产生错误结构。
             return
+        # ① 先把孩子从当前所在位置摘除（组感知、按身份页内定位）：不摘的话
+        #    它们会同时留在顶层和容器里 → 同一几何被拍平两次。
+        for ch in self._kids:
+            self.page.doc.remove(ch)
+        # ② 按解组前的顺序挂回 children（index=None ⇒ append，天然保序；
+        #    Page.attach 自带身份幂等，重跑不会重复挂）。
+        for ch in self._kids:
+            self.page.doc.attach(ch, owner=self.container)
+        # ③ 最后挂容器（owner + 原下标）：顺序反过来就成了「空组 + 孩子在顶层」。
         self.page.doc.attach(self.container, owner=self._owner, index=self._index)
         self._after_ungroup(list(self.container.children))
         self.page._after_change()

@@ -236,6 +236,31 @@ def _clone_item(item: Item, *, dz: float, z: float) -> Item:
     return _item_from_json(_item_to_json(item), dz=dz, z=z)
 
 
+def _restack_above(item: Item, top: float) -> float:
+    """把 ``item`` 的**整棵子树**抬到 ``top`` 之上，返回抬完后的 top。
+
+    「落在最上层」这条策略由**调用点**（:meth:`LayoutPage._paste` /
+    :meth:`LayoutPage._duplicate`）施加，而不是让 :func:`_item_from_json` 去改
+    子项的 z —— 那对会把它从「忠实的序列化/反序列化对」变成「顺带改层序的地方」
+    （且子项 z 保留是既有冻结契约）。这里按**叶子**平移：
+
+    - :func:`~megapro.gui.layout.model.flatten_visible` 只按**叶子** z 排序，
+      **容器 z 不参与** ⇒ 只抬容器 z 等于没抬，副本会掉回原有图元之下（实测：
+      容器 z=102 而成员 z=1/2，拍平序被压到 TOP 之下）。
+    - 平移量 = ``top + 1 − 最低叶子 z``，故**最低成员**也严格高于 ``top``；
+      组内相对次序（谁在上）**原样保持**（统一平移，不逐项重排）。
+    - 散件（无 children）行为与旧实现逐位一致：它自己的叶子抬到 ``top + 1``。
+    """
+    leaves = list(iter_leaves([item]))
+    if not leaves:
+        return top
+    delta = (top + 1.0) - min(leaf.z for leaf in leaves)
+    if delta:
+        for leaf in leaves:
+            leaf.z = float(leaf.z) + delta
+    return max(top, max(leaf.z for leaf in leaves))
+
+
 class LayoutPage(QtWidgets.QWidget):
     """排版页：信号 export_requested(JobSpec) 供 MainWindow 送去作业。
 
@@ -655,7 +680,18 @@ class LayoutPage(QtWidgets.QWidget):
 
         渲染单元仍是 :func:`iter_leaves`（容器不建 PathItem，M1/M2 契约），
         只吃**当前页**（``doc.items`` 已是当前页门面）。
+
+        **组编辑态在这里复位**（页切换 / 加页 / 删页 / 复制页 / 页重排五个操作的
+        共同汇流点）：``GroupOverlay.editing`` 指的是**某个具体容器**，换页后它
+        属于上一页，而 ``_expand_group_selection`` / ``on_item_double_clicked`` /
+        :meth:`_selected_units` 全都拿它当哨兵 ⇒ 不复位的话，新页里「点组内子项
+        选不中整组 / 双击进不去组 / 组框不画 / 拖动缩放对齐分布层序复制全按叶子
+        语义走」—— 整组编辑语义在下一页**静默失效**。editing 只当哨兵用（容器
+        对象从不被解引用），故不会崩，只会一直错下去。
+
+        复位本身是用户预期内的（换页本就换了内容），故不发状态提示。
         """
+        self._group_overlay.set_editing(None)   # 顺带清掉上一页残留的组框
         for gi in list(self._scene_items):
             self.scene.removeItem(gi)
         self._scene_items.clear()
@@ -1115,8 +1151,9 @@ class LayoutPage(QtWidgets.QWidget):
         top_z = self.doc.top_z()
         for d in data:
             it = _item_from_json(d, dz=5.0, z=top_z + 1)
+            # 整棵子树抬到最上（散件=自身，行为与旧实现一致）
+            top_z = _restack_above(it, top_z)
             items.append(it)
-            top_z = max(top_z, it.z)
         if items:
             self._undo.push(AddItemsCommand(self, items, "粘贴"))
 
@@ -1130,8 +1167,9 @@ class LayoutPage(QtWidgets.QWidget):
             if id(unit) in seen:
                 continue
             seen.add(id(unit))
-            items.append(_clone_item(unit, dz=5.0, z=top_z + 1))
-            top_z = max(top_z, items[-1].z)
+            clone = _clone_item(unit, dz=5.0, z=top_z + 1)
+            top_z = _restack_above(clone, top_z)   # 整棵子树都要在最上（见 _restack_above）
+            items.append(clone)
         if items:
             self._undo.push(AddItemsCommand(self, items, "复制副本"))
 

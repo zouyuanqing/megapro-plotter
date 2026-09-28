@@ -30,8 +30,17 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
   ``flatten_visible``（祖先链）共用它，不各写一套。产品路径上容器变换
   **恒为恒等**（组变换走叶子集合，FR-04/FR-05 裁决），一般式是防御性 pin ——
   防任何一条几何链按恒等特化而漏掉父变换项。
-- 拍平按**单元自身 z 全局升序（稳定）**；容器 z 只作用于**容器自身折线**的
-  单元，不参与子项排序（单一容器 z 无法再现 z 不连续编组的交错）。
+- 拍平按**单元自身 z 全局升序**，**并列 z 的 tie-break = 入档序
+  ``Item.order``**（A4）—— **不是** DFS 先序。容器 z 只作用于**容器自身
+  折线**的单元，不参与子项排序（单一容器 z 无法再现 z 不连续编组的交错）。
+  排序键与**树形无关**是 FR-03①「任意选择编组前后拍平逐点恒等」的技术前提：
+  旧实现用稳定排序的 ``key=z``，并列项 tie-break 落到 DFS 先序上，而编组把
+  非相邻成员拉到第一个成员的槽位、DFS 序随之改变 ⇒ 一次编组就静默改掉切割
+  次序，且**不可逆**（几何多重集守恒、不少切，但顺序进了 SVG 与 G-code）。
+  实跑：a(z=0)、b(z=1)、c(z=1) 编组 [a,c] 后 x 序 ``[0,10,20]`` →
+  ``[0,20,10]``；随机 1000 次 z 并列编组失败 143 次、z 互异 0 次。
+  **对无 children 的文档逐位不变**：那里 ``order`` == 列表序，
+  ``(z, order)`` ≡ 原「稳定 ``key=z``」（5000 例随机叶子文档差分验证 0 不一致）。
 - 容器**自身 paths** 也是几何（可为空但不丢）；``bbox``/``page_bbox``/拍平/
   枚举面（``items_visible``/``sorted_items``）一律同一口径走全树，不留只看
   顶层的残面。
@@ -120,6 +129,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
+from itertools import count
 
 from megapro.gui.canvas.coords import BED_H, BED_W, mirror_scalar
 
@@ -148,6 +158,53 @@ Polyline = list[tuple[float, float]]
 #: 成环（组把自身选进子集，FR-03① 的「任意选择」包含之）在无保护时是
 #: ``RecursionError``；越限改为可诊断的 :class:`ValueError`。
 MAX_TREE_DEPTH = 64
+
+#: **图元入档序**序号源（A4）。拍平并列 z 的 tie-break 用它，**不用** DFS
+#: 先序 —— 后者随树形变化，见 :func:`_stamp_order`。
+_ORDER_SEQ = count(1)
+
+
+def _stamp_order(item: Item) -> int:
+    """给图元**首次入档**编号（幂等；已编号的直接返回）。
+
+    **为什么需要它**（A4）：拍平是 ``sorted(..., key=z)`` 的**稳定**排序，
+    并列 z 的 tie-break 实际是 :func:`iter_flattens` 的 DFS 先序，而 DFS 先序
+    **依赖树形** —— :meth:`Page.group_items` 把非相邻成员拉到第一个成员的槽位
+    连成一段（``['G','b']`` + ``G.children=['a','c']`` ⇒ DFS 给 a、c、b），
+    于是「拍平顺序」在一次编组后静默改变，并**不可逆**（解组也回不去）。
+    实跑：a(z=0)、b(z=1)、c(z=1) 编组 [a,c] ⇒ x 序 ``[0,10,20]`` →
+    ``[0,20,10]``；z=[0,1,0,1,1,1,1] 取 [0,3] 亦然；随机压力 1000 次 z 并列
+    失败 143 次。几何多重集守恒（不少切不重复），但顺序进了导出的 SVG 与
+    发往机器的 G-code ⇒ 切割次序变了。
+
+    改用**与树形无关的入档序**做 tie-break 后，编组/解组只改树形不改编号 ⇒
+    拍平顺序恒定（FR-03① 对任意选择成立）。且对**无 children 的文档**，
+    编号 = 列表序 ⇒ ``(z, order)`` 与原 ``(z, 稳定序)`` **逐位相同**，基线
+    golden 不受影响。
+
+    编号点 = 一切**入档**路径（:meth:`Page.attach` / :meth:`Document.add` /
+    构造 / ``items`` 赋值）＋ :func:`stamp_orders` 的 DFS 兜底
+    （覆盖外部直接 ``page.items.append``）；:meth:`Page.group_items` 在**重排
+    之前**先按当时文档序编号，确保「先编组、后拍平」也不失真。
+    """
+    if item.order < 0:
+        item.order = next(_ORDER_SEQ)
+    return item.order
+
+
+def stamp_orders(items: list[Item]) -> None:
+    """兜底：按 DFS 先序给**尚未编号**的图元补 ``order``（原地，幂等）。
+
+    覆盖绕过 :meth:`Page.attach` / :meth:`Document.add` 的直接写入
+    （``page.items.append(...)``，测试与部分调用方在用）。无 children 时
+    DFS 先序 == 列表序，故叶子文档的编号与基线一致。
+
+    只在**从未被编号**的树上兜底：一旦经过 :meth:`Page.group_items`（它会先
+    编号再重排），成员已带号，DFS 兜底对它们是空操作 —— 这正是「先编组后
+    拍平」不失真的原因。
+    """
+    for it in iter_items(items):
+        _stamp_order(it)
 
 
 def _check_depth(depth: int) -> None:
@@ -272,6 +329,15 @@ class Item:
     # 翻转实现 flip_y_scalar），本文件不写任何翻转算术。
     mirror_x: bool = False
     mirror_y: bool = False
+    #: **入档序**（A4）：首次进入文档时由 :func:`_stamp_order` 赋单调递增值，
+    #: ``-1`` = 尚未编号。它是拍平**并列 z 的 tie-break**，取它而不取 DFS 先序
+    #: 是因为后者随树形变化 —— 编组把非相邻成员拉成一段后 DFS 序即改变，
+    #: 导致一次编组就静默改掉切割次序且不可逆（详见 :func:`_stamp_order`）。
+    #:
+    #: **不进剪贴板 JSON**（``layout_page._item_to_json`` 用显式字段表）——
+    #: 粘贴出来的是新图元，按入档顺序重新编号即可。深拷贝（复制页）会连号
+    #: 一起复制，但不同页各自排序，无冲突。
+    order: int = -1
 
     def is_container(self) -> bool:
         """容器 = ``children`` 非空（FR-01 术语）。
@@ -494,10 +560,15 @@ class Page:
         总是落到顶层末尾、解组后子项也全被追加 —— 顶层序无法复原
         （``test_group_ungroup_preserves_flatten_pointwise_and_order`` 钉住：
         ``[a,c,b]`` 编组再解组必须回到 ``[a,c,b]`` 而非 ``[c,a,b]``）。
+
+        **入档即编号**（A4）：任何挂载都是一次入档，故先 :func:`_stamp_order`。
+        编号与树形无关 ⇒ 拍平并列 z 的 tie-break 稳定（见 :func:`flatten_visible`）。
+        已编号者是幂等空操作，故 undo 重挂恢复的是**原编号**、原顺序。
         """
         if owner is None:
             if any(cur is item for cur in self.items):
                 return
+            _stamp_order(item)
             if index is None or not (0 <= index <= len(self.items)):
                 self.items.append(item)
             else:
@@ -505,6 +576,7 @@ class Page:
             return
         if any(ch is item for ch in owner.children):
             return
+        _stamp_order(item)
         if index is None or not (0 <= index <= len(owner.children)):
             owner.children.append(item)
         else:
@@ -516,16 +588,21 @@ class Page:
         「几何拥有者」= 自身 ``paths`` 非空的图元：叶子恒是，带自身折线的容器
         也是（容器自身折线是一等几何，见 :func:`iter_flattens`）——枚举面必须
         与拍平面同口径，否则容器自身折线会从越界预检里消失。
+
+        **tie-break = 入档序**（A4），与 :func:`flatten_visible` 同一口径：
+        枚举面若按 DFS 先序解并列，编组一次就会让「层序」随树形漂移。
         """
+        stamp_orders(self.items)
         return sorted(_own_geometry(self.items, visible_only=False),
-                      key=lambda it: it.z)
+                      key=lambda it: (it.z, it.order))
 
     def items_visible(self) -> list[Item]:
-        """可见**几何拥有者**（同上），按 z 升序。
+        """可见**几何拥有者**（同上），按 z 升序（并列按入档序，A4）。
 
         隐藏容器跳过整棵子树（组内成员逐个隐藏仍有效）。
         """
-        return sorted(_own_geometry(self.items), key=lambda it: it.z)
+        stamp_orders(self.items)
+        return sorted(_own_geometry(self.items), key=lambda it: (it.z, it.order))
 
     def contains(self, item: Item) -> bool:
         """全树身份查找。
@@ -574,9 +651,18 @@ class Page:
         - **顶层列表序的复原范围**：**相邻**成员编组再解组 ⇒ 顶层序精确复原
           （undo 的强契约）；**非相邻**成员（如 ``a、b`` 中间夹 ``c``）解组后
           成员并到组槽位**成连续一段** —— 编组本身就把它们拉到了一起，顶层序
-          不可复原。但**拍平（= 实际切割次序）两种情况都逐点恒等**，因为它按
-          叶子 z 稳定排序、与顶层列表序无关。FR-03① 的验收契约是拍平恒等，
-          故非相邻情形同样成立。
+          不可复原。但**拍平（= 实际切割次序）两种情况都逐点恒等** —— 见下条
+          「并列 z 的 tie-break」。
+        - **并列 z 的 tie-break = 入档序，不是 DFS 先序**（A4）。这是上面那条
+          承诺成立的技术前提：拍平排序键是 ``(z, order)``（:attr:`Item.order`
+          ＝首次入档时分配、编组解组都不改），**与树形无关**。旧实现是稳定排序
+          的 ``key=z``，并列项的 tie-break 落到 DFS 先序上，而 DFS 先序**随
+          树形变**（非相邻成员被拉成一段）⇒ 一次编组就静默改掉切割次序，且
+          **不可逆**（解组也回不去）。实跑：a(z=0)、b(z=1)、c(z=1) 编组 [a,c]
+          后 x 序 ``[0,10,20]`` → ``[0,20,10]``；z=[0,1,0,1,1,1,1] 取 [0,3]
+          同因；随机压力 1000 次 z 并列失败 143 次、z 互异 0 次（并列才触发）。
+          故本方法在**重排之前**先按当时文档序给成员编号
+          （:func:`_stamp_order`），确保「先编组、后拍平」也不失真。
 
         返回新容器；未编组时返回 ``None``。
         """
@@ -600,6 +686,12 @@ class Page:
         # 按当前文档顺序排序（顶层列表序，其次容器内序）→ 成员顺序稳定可预期
         order = {id(it): i for i, it in enumerate(iter_items(self.items))}
         chosen.sort(key=lambda it: order.get(id(it), 1 << 30))
+        # ⚠ **重排之前**先按当时的文档序给成员编号（A4）。拍平的并列 z
+        # tie-break 用 ``Item.order``；若等到 :func:`flatten_visible` 的 DFS
+        # 兜底再编号，编号会取**重排后**的 DFS 序（非相邻成员已被拉成一段）
+        # ⇒ 恒等性照样被破坏。先编号，本方法就与「何时拍平」解耦。
+        for it in chosen:
+            _stamp_order(it)
         cont = Item(name=name, z=0.0, children=[])
         placements: list[DetachInfo] = []
         for it in chosen:
@@ -710,6 +802,10 @@ class Document:
             self.pages = [Page()]
         self._clamp_current()
         if self._init_items is not None:
+            # ``Document(items=[...])`` 是入档路径 ⇒ 按**列表序**编号（A4）。
+            # 不靠 :func:`stamp_orders` 兜底：这里列表序就是构造者给的序。
+            for it in self._init_items:
+                _stamp_order(it)
             self.page.items = list(self._init_items)
             self._init_items = None
         self._sync_page_bed(to_page=True)
@@ -749,6 +845,9 @@ class Document:
 
     @items.setter
     def items(self, value: list[Item]) -> None:
+        # 整体替换顶层列表也是入档 ⇒ 按传入**列表序**编号（A4）
+        for it in value:
+            _stamp_order(it)
         self.page.items = list(value)
 
     @property
@@ -756,6 +855,7 @@ class Document:
         return len(self.pages)
 
     def add(self, item: Item) -> None:
+        _stamp_order(item)   # 入档即编号（A4）
         self.page.items.append(item)
 
     def remove(self, item: Item) -> "DetachInfo | None":
@@ -1067,8 +1167,19 @@ def normalize_local(item: Item) -> tuple[float, float]:
 def flatten_visible(doc: Document) -> list[Polyline]:
     """拍平全部可见图元为**绝对页面坐标**折线（跳过 <2 点折线）。
 
-    按 z 升序（稳定）；容器 z 不参与排序（FR-02 v1.3 —— 单一容器 z 无法再现
+    按 z 升序；容器 z 不参与排序（FR-02 v1.3 —— 单一容器 z 无法再现
     z 不连续编组在全局序里的交错，如 z=0、2 夹 z=1）。
+
+    **并列 z 的 tie-break = 入档序 ``(z, order)``，不是 DFS 先序**（A4）。
+    这是 FR-03①「任意选择编组前后拍平逐点恒等」能成立的技术前提：排序键
+    **与树形无关**。旧实现是 ``key=z`` 的稳定排序，并列项的 tie-break 落到
+    :func:`iter_flattens` 的 DFS 先序上，而 DFS 先序随编组改变（非相邻成员被
+    拉到第一个成员的槽位连成一段）⇒ 一次编组就静默改掉切割次序，且**不可逆**。
+    实跑：a(z=0)、b(z=1)、c(z=1) 编组 [a,c] 后 x 序 ``[0,10,20]`` →
+    ``[0,20,10]``（多重集守恒、不少切，但顺序进了 SVG 与发往机器的 G-code）。
+    改用 ``(z, order)`` 后编组/解组只改树形不改编号 ⇒ 拍平顺序恒定。
+    **对无 children 的文档逐位不变**：那里 ``order`` == 列表序，
+    ``(z, order)`` ≡ 原「稳定 ``key=z``」。
 
     **祖先变换必须参与**：每个单元先过自身变换，再按祖先链由内到外逐层
     合成（父∘子，一般式）。容器恒等时退化为「子项现状几何」，产品路径无
@@ -1076,7 +1187,10 @@ def flatten_visible(doc: Document) -> list[Polyline]:
     位置、导出却在未变换位置（预览≡发送断裂）。
     叶子文档与原「``items_visible()`` 逐项 transformed_paths」逐位相同。
     """
-    units = sorted(iter_flattens(doc.items), key=lambda u: u[0].z)
+    # 兜底编号：覆盖绕过 attach/add 的直接写入（``doc.items.append``）。
+    # 无 children 时 DFS 先序 == 列表序，故叶子文档的编号与基线一致。
+    stamp_orders(doc.items)
+    units = sorted(iter_flattens(doc.items), key=lambda u: (u[0].z, u[0].order))
     out: list[Polyline] = []
     for _it, paths, chain in units:
         for anc in reversed(chain):  # 由内到外：父∘子

@@ -827,6 +827,33 @@ class Page:
             chosen.append(it)
         if len(chosen) < 2:
             return None
+        # **归属拒绝（A3）**：每个成员都必须**在当前页的树里**。
+        #
+        # 此前本方法只做「自含拒绝」，于是两种成员会**静默**把模型搞坏：
+        # ①**跨页成员**（挂在别的页）：``Page.remove`` 在当前页找不到它 ⇒
+        #    ``info is None`` ⇒ 它**没被摘走**却被 ``cont.children.append`` 收进
+        #    新容器。实测 ``doc.group_items([页0的i0, 页1的i1])`` 得到容器 G 落在页1、
+        #    ``G.children=['i1','i0']``，而页0 的 ``items`` 仍是 ``['i0']``
+        #    ⇒ **i0 同时属于两页** ⇒ 同一几何在两页各切一次（导出逐页、切纸机
+        #    跑两遍）。
+        # ②**文档外悬空成员**（从没入模）：同样 ``info is None`` ⇒ 同样被收进容器
+        #    ⇒ ``contains(悬空项)`` 由 False 静默变 True、``flatten_visible`` 条数
+        #    由 0 变 2 ⇒ **一个从未入模的图元凭空进了切割序列**。
+        # 旧的「``if not placements`` 全悬空才回滚」只兜住**全部**悬空的情形，
+        # **混合**选择（部分在、部分不在）照样放行 —— 恰是 UI 不会产生、模型层
+        # 必须挡住的那种。
+        #
+        # 为什么**返回 None 而不是过滤掉不合规成员**：过滤会让用户以为编了 N 个、
+        # 实际只编了 k 个，几何少了几条却**没有任何提示**（静默少切）。而这两种
+        # 成员都只可能来自调用方的错误（UI 的选择集恒来自当前页场景，跨页/悬空
+        # 不可达），故整单拒绝并让调用方自己决定报不报。
+        #
+        # 判据用 :meth:`Page.contains`（**当前页**语义）—— 与 :meth:`remove` 的
+        # 搜索域**完全一致**才是自洽的：若两者口径不同，就会出现「校验说在、
+        # 摘不走」这种比原来更难查的半截状态。回归见
+        # ``tests/test_gui_layout_group_ownership.py``。
+        if not all(self.contains(it) for it in chosen):
+            return None
         # 自含拒绝：任一成员的**真**子树（不含自身）∩ 待编组集 ≠ ∅ → 成环
         chosen_ids = {id(it) for it in chosen}
         for it in chosen:

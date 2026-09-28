@@ -428,3 +428,69 @@ def test_group_mirror_is_per_member_about_own_center():
     lp._undo.undo()
     assert lp.to_job_spec().paths_paper == before
     lp.deleteLater()
+
+
+def test_mirror_page_bbox_conserved_iff_angle_multiple_of_90():
+    """页面系 AABB 的守恒条件 = ``angle_deg`` 是 90° 的整数倍（A5 契约更正）。
+
+    A5 把模块 docstring 里「原位镜像 ⇒ bbox 稳定」拆成本地/页面两系后，
+    可复述的**不变量**是下面三条（都与图形形状无关；反之「N/3601 个角度
+    不同」这类计数**随形状变**，不得写进契约）：
+
+    1. :meth:`Item.bbox`（**本地**系）在**任何**角度上镜像前后**逐位恒等** ——
+       它只读 ``self.paths``，根本不看镜像标志；画布的
+       ``PathItem.boundingRect`` 吃的就是它。
+    2. :meth:`Item.page_bbox`（**页面系**轴对齐外接框）**仅当**角度为 90°
+       整数倍时在精确数学下守恒（此时页面系 x/y 轴与本地镜像轴重合）。
+    3. 比 2 时须容许浮点噪声：实测 270°/360° 上差 ~8.9e-16（``cos/sin`` 舍入）。
+
+    ⚠ **两个方向都断言**。只钉「90° 倍数守恒」会在「镜像整体没生效」时
+    **空过**（不翻当然也不变）；故同时钉住：非 90° 倍数上 page_bbox **必须**
+    不同、且 ``transformed_paths`` **必须**真的变了（镜像确实在做事）。
+    守住 1 的同时守住 2 的反面 —— 这正是 A5 那条「契约陈述失真」要防的东西。
+    """
+    from megapro.gui.layout.model import Item
+
+    # 非对称形状：对称件的 page_bbox 可能处处守恒，测不出任何东西
+    shape = [[(0.0, 0.0), (4.0, 0.0), (0.0, 3.0), (2.0, 5.0), (0.0, 0.0)]]
+
+    def _mk(angle: float, mirror: bool) -> Item:
+        it = Item(paths=[list(p) for p in shape], name="tri", angle_deg=angle)
+        if mirror:
+            it.mirror_x = True
+        return it
+
+    def _close(b0, b1, tol=1e-9) -> bool:
+        return all(abs(x - y) <= tol for x, y in zip(b0, b1))
+
+    # --- 不变量 1：本地 bbox 逐位恒等，3601 个角度无一例外 ---
+    for i in range(3601):
+        angle = i / 10.0
+        assert _mk(angle, False).bbox() == _mk(angle, True).bbox(), (
+            f"本地 bbox 在 angle={angle} 上被镜像改变了 —— 画布 boundingRect "
+            "会跳，这是必须守住的不变量 1")
+
+    # --- 不变量 2：90° 整数倍守恒（容浮点） ---
+    for angle in (0.0, 90.0, 180.0, 270.0, 360.0):
+        assert _close(_mk(angle, False).page_bbox(), _mk(angle, True).page_bbox()), (
+            f"page_bbox 在 angle={angle}（90° 整数倍）上不守恒，违反不变量 2")
+
+    # --- 不变量 2 的反面：非 90° 倍数**必须**不同，且镜像确实生效 ---
+    differing = 0
+    for i in range(3601):
+        angle = i / 10.0
+        if angle % 90.0 == 0.0:
+            continue
+        plain, mirrored = _mk(angle, False), _mk(angle, True)
+        # 镜像**真的在改几何**（否则下面的「不同」可能是别的 bug）
+        assert mirrored.transformed_paths() != plain.transformed_paths(), (
+            f"angle={angle} 上镜像没有改变路径 —— 镜像没生效，下面的断言无意义")
+        if not _close(plain.page_bbox(), mirrored.page_bbox()):
+            differing += 1
+    # 绝大多数非 90° 倍数上应不同；不钉死具体个数（随形状变），
+    # 但必须**有一个以上**，否则「页面系也不守恒」这句话就是假的
+    assert differing > 0, (
+        "非 90° 倍数上 page_bbox 处处守恒。两种可能：① 本用例的形状对该轴"
+        "对称，换个非对称形状再测；② **有人给镜像加了 pos/scale/angle 补偿**"
+        " —— 那正是 PRD v1.3 明令禁止的改法（会破坏不变量 1 的意图），"
+        "别去改断言")

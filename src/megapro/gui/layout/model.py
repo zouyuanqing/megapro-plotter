@@ -70,7 +70,8 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
 - **镜像（FR-08）**：`mirror_x``/``mirror_y`` 布尔，**支点 = 本地 bbox 中心**
   （一般式，v1.3 定稿，**不依赖** ``normalize_local`` 的 ``y0==0`` 不变量 ——
   它只在创建/导入入口调用，直接构造的 Item 同样要正确），``pos``/``scale``/
-  ``angle_deg`` **不补偿**（原位镜像 ⇒ bbox 稳定、位置不动）。合成顺序
+  ``angle_deg`` **不补偿**（原位镜像 ⇒ **本地** bbox 稳定、位置不动；页面系的
+  旋转件 AABB **不**稳定，见下）。合成顺序
   **mirror → scale → rotate → translate**（:func:`_apply_transform` 首个分支）。
   镜像数学只在 :func:`coords.mirror_scalar`（复用唯一翻转实现
   :func:`coords.flip_y_scalar`），**本文件不写任何翻转算术**
@@ -87,6 +88,27 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
     pos/scale/rotation、**不重建** QPainterPath ⇒ 只改标志画布纹丝不动。
     setattr 通道（``ChangeItemPropsCommand``）据此按 ``_GEOMETRY_FIELDS``
     额外 ``rebuild_path()``。
+  - ⚠ **「bbox 稳定」只在本地系成立，页面系不成立**（A5 更正，数学未改）。
+    镜像轴定义在**本地系**、绕**本地 bbox 中心**，故 :meth:`Item.bbox` 与
+    ``PathItem.boundingRect``（画布用）**稳定**：:meth:`Item.bbox` 只读
+    ``self.paths``、根本不看镜像标志，而 :meth:`Item.local_paths` 的镜像
+    是绕中心的反射、是等距变换 ⇒ 跨度不变。
+    但 :meth:`Item.page_bbox` 先拍平再取**页面系轴对齐**外接框 ⇒ 对
+    **旋转件**不守恒：绕中心反射后的形状与原形状在旋转后的 AABB 里一般不同。
+    后果是属性面板读 ``page_bbox`` 算宽高时**旋转件镜像后宽高会跳**，而
+    画布上的边长与面积**完全没变**（变的是外接框，不是图形）。这是 PRD v1.3
+    「不补偿」裁决的必然结果，**不是实现笔误**，故此处只更正陈述、不动镜像数学。
+    - **可复述的不变量（与形状无关，已被 ``tests/test_gui_mirror.py``
+      ``test_mirror_page_bbox_conserved_iff_angle_multiple_of_90`` 钉死）**：
+      ①:attr:`Item.bbox`（本地系）在**任何** ``angle_deg`` 上镜像前后**逐位恒等**；
+      ②``page_bbox``（页面系）**仅当** ``angle_deg`` 为 90° 整数倍时在**精确
+      数学**下守恒（此时页面系 x/y 轴与本地镜像轴重合），其余角度一般不等；
+      ③比较②时须容许浮点噪声 —— 实测 270°/360° 上差 **8.88e-16**（±0 级），
+      是 ``math.cos/sin`` 的舍入，不是几何差异。
+    - ⚠ **不要在本文件里引用「N/3601 个角度不同」这类计数**：它**随形状变**
+      （同一台机器上，三角件按 ``page_bbox`` 四元组逐位比较得 3598/3601、
+      按跨度比较得 3520/3601，另一样例又是别的数）。写死一个计数等于把一个
+      样例读数冒充成普遍事实。可复述的只有上面的①②③。
 - **删除/复原的归属契约**：:meth:`Document.remove` **组感知**（按身份定位 owning
   container 并从其 children 摘除）并返回 :class:`DetachInfo`（原容器 + 原下标），
   :meth:`Document.attach` 为其逆。**两者必须成对使用**：只组感知而不把归属信息
@@ -116,12 +138,23 @@ paint 与导出同源于此模型 —— QGraphicsScene 只做展示；导出时
   恒空操作，**隐藏→显示切换永远画不出来**（M1 评审实测 ``iter_leaves([G])``
   对唯一隐藏叶子返回 ``[]``）。
 - **树的无环/深度保护**：所有递归遍历（:func:`iter_items` /
-  :func:`iter_flattens` / :meth:`Item.bbox` / :meth:`Item.transformed_paths`）
-  共享 :data:`MAX_TREE_DEPTH` 上限，越限抛 :class:`ValueError`（原为
-  ``RecursionError``，不可诊断）。PRD §11 问题 1 问「是否需要深度上限」——
-  定稿为**需要**：FR-03① 的验收是「对**任意选择**编组/解组前后恒等」，
-  而任意选择包含「组选自己」，无保护即成环。组入口的「待编组集合 ∩ 新容器
-  子树 = ∅」自含拒绝属 M2（FR-03/T3）。
+  :func:`iter_ancestors` / :func:`iter_flattens` / :func:`iter_leaves` /
+  :func:`iter_units` / :meth:`Item.bbox` / :meth:`Item.transformed_paths` /
+  :meth:`Item.descendants`）共享 :data:`MAX_TREE_DEPTH` 上限，越限抛
+  :class:`ValueError`（原为 ``RecursionError``，不可诊断）。PRD §11 问题 1 问
+  「是否需要深度上限」——定稿为**需要**：FR-03① 的验收是「对**任意选择**
+  编组/解组前后恒等」，而任意选择包含「组选自己」，无保护即成环。组入口的
+  「待编组集合 ∩ 新容器子树 = ∅」自含拒绝属 M2（FR-03/T3）。
+  ⚠ :meth:`Item.descendants` 曾**不在此列**（A5 补齐）：它与 :meth:`Page.group_items`
+  的自含拒绝都直接递归，成环时抛不可诊断的 ``RecursionError``，且在合法无环
+  深树上只靠 Python 自身递归上限存活到 998 层 —— 这条「所有递归遍历」的声明
+  此前是假的。派生入口（``iter_leaves``/``iter_units`` 经 ``iter_flattens``、
+  ``top_z``/``bottom_z``/``sorted_items``/``items_visible`` 经 ``iter_items``、
+  ``unit_page_bbox`` 经 ``transformed_paths``）继承守卫，无需单列。
+  ⚠ 共享的是**守卫谓词**（``_depth > MAX_TREE_DEPTH`` 即抛），**不是**同一个
+  容差：``iter_items`` 对空 children 也建生成器，故**早一层**抛；本方法 /
+  ``bbox`` / ``transformed_paths`` 只在确有 children 时下探，故晚一层。逐入口的
+  实测边界见 :meth:`Item.descendants`。
 """
 
 from __future__ import annotations
@@ -325,8 +358,12 @@ class Item:
     children: list["Item"] = field(default_factory=list)  # 非空即容器
     # 镜像（FR-08）：支点 = **本地 bbox 中心**（一般式，v1.3 定稿），
     # pos/scale/angle **不补偿**（原位镜像：内容绕自身中心像点翻转，仅标志
-    # 变更 ⇒ bbox 稳定、页面位置不变）。数学在 coords.mirror_scalar（复用唯一
-    # 翻转实现 flip_y_scalar），本文件不写任何翻转算术。
+    # 变更 ⇒ **本地** bbox 稳定、页面位置不变）。数学在 coords.mirror_scalar
+    # （复用唯一翻转实现 flip_y_scalar），本文件不写任何翻转算术。
+    # ⚠ 稳定的是**本地**系：``bbox()`` 只读 paths、``local_paths`` 的镜像绕
+    # 中心反射故跨度不变；但 ``page_bbox()`` 是**页面系轴对齐**外接框，
+    # **旋转件镜像后会变**（仅 angle 为 90° 整数倍时守恒）—— 图形边长/面积
+    # 始终不变，变的只是外接框。见模块 docstring 镜像节的 A5 更正。
     mirror_x: bool = False
     mirror_y: bool = False
     #: **入档序**（A4）：首次进入文档时由 :func:`_stamp_order` 赋单调递增值，
@@ -414,7 +451,9 @@ class Item:
         FR-08：镜像**必须**烘进画笔路径 —— 只改 ``mirror_x/mirror_y`` 标志而
         不重画，场景上什么都不会变（``apply_model_state`` 只应用
         pos/scale/rotation，见 ``canvas/items.py``）。镜像绕**本地 bbox 中心**，
-        故 ``boundingRect`` 稳定。
+        反射保跨度 ⇒ ``boundingRect``（本地系、画布用）稳定。
+        ⚠ 这**不等于**页面系 AABB 稳定：``page_bbox()`` 对旋转件镜像后会变
+        （A5 更正，见模块 docstring 镜像节）—— 但那不影响本方法的画布用途。
 
         未设镜像时**逐位等于** ``item.paths``。两轴**各自**判退化
         （:func:`_axis_mirrors`）—— 一轴退化不得牵连另一轴。
@@ -449,11 +488,61 @@ class Item:
             return (0.0, 0.0, 0.0, 0.0)
         return (min(xs), min(ys), max(xs), max(ys))
 
-    def descendants(self) -> list["Item"]:
-        """自身 + 全部后代（DFS，前序）。含自身便于「组选中 = 整棵子树」判定。"""
+    def descendants(self, *, _depth: int = 0) -> list["Item"]:
+        """自身 + 全部后代（DFS，前序）。含自身便于「组选中 = 整棵子树」判定。
+
+        **受 :data:`MAX_TREE_DEPTH` 约束**（A5 补齐）。此前本方法是唯一的
+        递归遍历**没有**接深度守卫，成环（``a.children=[b]``、``b.children=[a]``）
+        时抛不可诊断的 :class:`RecursionError`，且在**合法无环深树**上也只能靠
+        Python 自身的递归上限存活到 998 层（守卫型入口 ~65 层就抛）。
+        守卫**谓词**与其余遍历同源：``_check_depth`` 在 ``_depth >
+        MAX_TREE_DEPTH`` 时抛 :class:`ValueError`。
+
+        ⚠ 但「同源」**不等于**「一刀切」：各入口**能容忍的层数差一层**。
+        实测（``MAX_TREE_DEPTH=64``、65/66 项链）：
+        :func:`iter_items` 家族（含派生的 ``top_z``/``bottom_z``/
+        ``sorted_items``/``items_visible``/``contains``/``page_of``/``owner_of``）
+        **65 项就抛** —— 它的 ``yield from iter_items(it.children, _depth+1)``
+        对**空 children 也建**一次生成器，叶子那层因此先撞守卫；本方法与
+        :meth:`bbox` / :meth:`transformed_paths` 只在**确有 children** 时才
+        下探一层，故 65 项放行、66 项才抛。差一层是既有实现的形状（A5 未统一 ——
+        统一要动 :func:`iter_items` 的既有容差，超出本轮范围），此处只把真话
+        说准，别让后来者以为上限是精确的 64。
+
+        :meth:`Page.group_items` 的**成环自含拒绝**内部要遍历每个成员的子树，
+        故它此前也随之抛 ``RecursionError``；现在同样得到可诊断的
+        ``ValueError``。
+
+        **逐入口的实测容差**（n 层链首次抛 ``ValueError`` 的层数，
+        ``MAX_TREE_DEPTH=64``；模块 docstring「共享的是守卫谓词、不是同一个
+        容差」说的就是这张表，回归见
+        ``tests/test_gui_layout_tree_guard.py::test_depth_tolerance_is_one_layer_apart``）：
+
+        ====================================  ==========================
+        入口                                    首次抛的层数
+        ====================================  ==========================
+        :func:`iter_items`                        65（**早一层**）
+        :func:`iter_ancestors` / :func:`iter_flattens` /
+        :func:`iter_leaves` / :func:`iter_units` /
+        :func:`_own_geometry` / :meth:`Item.bbox` /
+        :meth:`Item.transformed_paths` / **本方法** /
+        :meth:`Item.page_bbox` / :meth:`Item.unit_page_bbox`
+                                                66
+        ====================================  ==========================
+
+        差异来源：:func:`iter_items` 对**空** ``children`` 也建生成器并先
+        ``_check_depth``；其余入口只在**确有** children 时才带着 ``_depth+1``
+        下探，故多容一层。差一层不影响正确性（两者都远低于 CPython 的
+        998 层递归上限，**不会**先炸成 ``RecursionError``）。
+
+        产品路径不可达（src/ 里只有 ``wrap_group`` 与 JSON 反序列化构造
+        children，JSON 语法表达不出环），所以这是**契约陈述失真**而非危险
+        bug —— 补的是「所有递归遍历都抛可诊断 ValueError」那句话的真伪。
+        """
+        _check_depth(_depth)
         out = [self]
         for ch in self.children:
-            out.extend(ch.descendants())
+            out.extend(ch.descendants(_depth=_depth + 1))
         return out
 
 
@@ -645,7 +734,12 @@ class Page:
         - 成员可为**任意 mix**：顶层散件 + 已存在的容器（组套组）。成员先按
           各自所在容器摘除（:meth:`remove` 的组感知），再挂进新容器。
         - **成环自含拒绝**：待编组集合若与任一成员子树有交集（把祖先选进自己
-          的子集）→ 返回 ``None``（不抛异常，调用侧可静默忽略或提示）。
+          的子集）→ 返回 ``None``（**这个判定本身不抛异常**，调用侧可静默忽略
+          或提示）。⚠ 但它靠遍历成员子树实现，故**若传入的树本身已经是环**，
+          遍历会撞上 :data:`MAX_TREE_DEPTH` 守卫而抛可诊断的
+          :class:`ValueError` —— 那不是「自含选择被拒」，是「模型数据已损坏」。
+          此前这里抛的是不可诊断的 ``RecursionError``（A5 补齐 :meth:`Item.descendants`
+          的守卫后一并解决）。产品路径不可达，见 :meth:`Item.descendants`。
         - 成员不足 2 个 → 返回 ``None``（无意义的单元素组）。
         - 容器插入位置 = **第一个成员的原位置**（owner + 下标）。
         - **顶层列表序的复原范围**：**相邻**成员编组再解组 ⇒ 顶层序精确复原

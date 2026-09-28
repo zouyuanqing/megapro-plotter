@@ -1391,13 +1391,24 @@ class LayoutPage(QtWidgets.QWidget):
     def _image_spec(self, source: str, *, mode: str, threshold: int,
                     use_multi: bool, target_mm: float,
                     low: int | None, high: int | None) -> dict:
-        """产线参数回执（FR-10：``Item.image_spec``，仿 ``text_spec``）。"""
+        """产线参数回执（FR-10：``Item.image_spec``，仿 ``text_spec``）。
+
+        **只记该模式真的吃进去的参数**（口径与 :meth:`_trace_image` 逐条对齐）：
+
+        - ``canny`` 只吃 ``low``/``high``（阈值对是梯度对）⇒ 不写
+          ``threshold``/``multi``。写进去就是**假信息**：看 spec（或照它重追）
+          会以为这两个参数参与了产线，其实被 :meth:`_trace_image` 的 canny 分支
+          直接忽略 —— 对话框把它们一并置灰（见 :meth:`_ask_image_params`）。
+        - 其它模式只吃 ``threshold``/``multi`` ⇒ 反过来不写 low/high。
+        """
         spec = {"source": str(source), "mode": mode,
-                "threshold": int(threshold), "multi": bool(use_multi),
                 "target_mm": float(target_mm)}
         if mode == "canny":
             spec["low"] = int(low) if low is not None else None
             spec["high"] = int(high) if high is not None else None
+        else:
+            spec["threshold"] = int(threshold)
+            spec["multi"] = bool(use_multi)
         return spec
 
     def _add_image(self) -> None:
@@ -1423,10 +1434,13 @@ class LayoutPage(QtWidgets.QWidget):
         if not paths:
             QtWidgets.QMessageBox.warning(self, "无线条", "阈值后没有可追踪的线条")
             return
-        # **全部折线**进模型（FR-10 坑 1）：旧实现 `_import_group([paths],
-        # ...)[0]` 只取第 [0] 条、其余静默丢弃 —— 而 Canny+骨架必然产出多条
-        # 折线（一个物体一条），那样 US-5「照片调参重追」直接残废。这里把
-        # paths 作为**单个**图元的多条折线（_import_group 长度为 1 ⇒ 一项）。
+        # **单 Item 持全部折线**（FR-10 坑 1 / US-5 承重契约）：Canny+骨架对一张
+        # 照片必然产出**多条**折线（一个物体一条），它们必须进**同一个** Item。
+        # 机制上：``_import_group`` 的入参是「组列表」，``[paths]`` 是**一个**组
+        # ⇒ 返回 1 个 Item，其 ``paths`` 就是那几条折线（``[0]`` 取的是**组**，
+        # 不是「第一条折线」—— 早前那版注释把它说成后者，是错的）。
+        # ⚠ 不要改成「每条折线一项」：:class:`RetraceImageCommand` 作用于
+        # **单个** item，拆开后重追会只换其中一条、其余留在原参数下（旧几何）。
         it = _import_group([paths], name=f"图:{Path(path).name[:8]}")[0]
         it.z = self.doc.top_z() + 1
         it.image_spec = self._image_spec(
@@ -1440,8 +1454,20 @@ class LayoutPage(QtWidgets.QWidget):
         high)``，用户取消返回 ``None``。
 
         ``spec``（重追时 = ``item.image_spec``）非空则**预填**各控件：模式/
-        阈值/多阈值/最长边/Canny 阈值都回到上次用的值，用户只改要改的那一项
+        阈值/多阈值/最长边/Canny 阈值都回到上次用的值，用户只改要改的那项
         （US-5「刻完后调阈值重追」的前提是其余参数不丢）。
+
+        两条诚实性约束（否则「预填」= 静默换一组参数重算，见 FR-10）：
+
+        1. **0 是合法取值**：Canny 阈值的预填走 ``spec.get(k)`` + ``is None``
+           判断，不能用 ``spec.get(k) or 默认值`` —— 后者把 ``0`` 吞成默认
+           （low=0/high=0 被预填成 50/120，用户点确定后**真的**用 50/120 重跑）。
+           其余字段（threshold/target_mm/mode/multi）沿用同函数既有的
+           ``.get(k, default)`` 写法。
+        2. **失效控件不装样子**：canny 分支只吃 low/high，``threshold``/``multi``
+           在该模式下无效 ⇒ 置灰 + 标签明说「不使用」。控件的**预填值原样保留**
+           （不销毁用户数据），真正的不诚实由 :meth:`_image_spec` 兜住 ——
+           canny 的 spec 里**不写**这两个从未参与产线的字段。
         """
         spec = dict(spec or {})
         dlg = QtWidgets.QDialog(self)
@@ -1464,11 +1490,14 @@ class LayoutPage(QtWidgets.QWidget):
         form.addRow("阈值(暗→线，未勾多阈值时用):", th)
         lo = QtWidgets.QSpinBox()
         lo.setRange(0, 255)
-        lo.setValue(int(spec.get("low") or 50))
+        # 0 是合法取值：只有「键缺失 / 值为 None」才回默认（``or`` 会吞 0）
+        lo.setValue(50 if spec.get("low") is None else int(spec["low"]))
+        lo.setToolTip("Canny 低阈（0 合法）")
         form.addRow("Canny 低阈:", lo)
         hi = QtWidgets.QSpinBox()
         hi.setRange(0, 255)
-        hi.setValue(int(spec.get("high") or 120))
+        hi.setValue(120 if spec.get("high") is None else int(spec["high"]))
+        hi.setToolTip("Canny 高阈（0 合法）")
         form.addRow("Canny 高阈:", hi)
         mm = QtWidgets.QDoubleSpinBox()
         mm.setRange(10, BED_W)
@@ -1479,6 +1508,23 @@ class LayoutPage(QtWidgets.QWidget):
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
         form.addRow(bb)
+
+        def _sync_mode_controls() -> None:
+            """模式 ⟶ 失效控件（canny 只吃 low/high，见 :meth:`_trace_image`）。
+
+            只**置灰 + 改标签**，不动控件里的值：值还在，但该模式下它不会被
+            消费，也不会进 spec（:meth:`_image_spec` 已按模式裁字段）。
+            """
+            canny = mode.currentData() == "canny"
+            th.setEnabled(not canny)
+            multi.setEnabled(not canny)
+            label = form.labelForField(th)
+            if label is not None:
+                label.setText("阈值(Canny 模式不使用):" if canny
+                              else "阈值(暗→线，未勾多阈值时用):")
+
+        mode.currentIndexChanged.connect(lambda _i: _sync_mode_controls())
+        _sync_mode_controls()
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return None
         return (mode.currentData(), th.value(), multi.isChecked(), mm.value(),

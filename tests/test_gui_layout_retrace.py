@@ -405,11 +405,25 @@ def test_retrace_dialog_prefills_from_spec(tmp_path, monkeypatch):
     lp.deleteLater()
 
 
-def test_add_image_records_spec_and_keeps_all_paths(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode, used, unused", [
+    ("canny", {"low": 50, "high": 120}, ("threshold", "multi")),
+    ("outline", {"threshold": 160, "multi": False}, ("low", "high")),
+])
+def test_add_image_records_spec_and_keeps_all_paths(
+        tmp_path, monkeypatch, mode, used, unused):
     """``_add_image`` 入库即记 spec，且**全部折线**都在（FR-10 坑 1 的回归）。
 
     文件对话框与参数对话框都被替换：只验「点确定」之后模型里剩下什么 ——
-    ``image_spec`` 是否记全、Canny 产出的多条折线是否一条不丢。
+    ``image_spec`` 是否**如实反映产线**、多条折线是否一条不丢。
+
+    ⚠ **冻结面例外（用户明确授权，B5）**：本用例原先无条件断
+    ``spec["threshold"] == 160``。而 ``threshold`` 在 Canny 模式下是
+    :meth:`_trace_image` **根本不读**的参数（canny 分支只吃 low/high）——
+    把一个从未参与产线的值写进 spec，照 spec 重追就得到假信息。故改为**按模式**
+    断言：spec 只含该模式真的生效的字段，另一模式的字段**必须不存在**。口径
+    依据 = :meth:`_trace_image` 真正消费的参数，不是「spec 里所有键」。
+    （模式取 ``canny``/``outline`` 两个：``center`` 在本合成样张、阈值 160 下
+    产出 0 条折线，走不完 ``_add_image``。）
     """
     import megapro.gui.layout.layout_page as L
     from PySide6 import QtWidgets
@@ -417,22 +431,30 @@ def test_add_image_records_spec_and_keeps_all_paths(tmp_path, monkeypatch):
     src = _synthetic_png(tmp_path)
     monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
                         staticmethod(lambda *a, **k: (src, "")))
-    # 参数对话框：canny / 阈值 160 / 不多阈值 / 100mm / low 50 / high 120
+    # 参数对话框：模式 / 阈值 160 / 不多阈值 / 100mm / low 50 / high 120
+    # （low/high 一并返回，但非 canny 模式不消费它们 → 不得进 spec）
     monkeypatch.setattr(
         L.LayoutPage, "_ask_image_params",
-        lambda self, **kw: ("canny", 160, False, 100.0, 50, 120))
+        lambda self, **kw: (mode, 160, False, 100.0, 50, 120))
     lp = L.LayoutPage()
     lp._add_image()
 
     assert len(lp.doc.items) == 1
     it = lp.doc.items[0]
-    # 全部 Canny 折线都在一个 Item 里
-    assert len(it.paths) >= 2, "Canny 对多目标应产出多条折线，不能只留一条"
+    # 全部折线都在一个 Item 里
+    assert len(it.paths) >= 2, f"{mode} 对多目标应产出多条折线，不能只留一条"
     assert len(it.transformed_paths()) == len(it.paths)
-    # spec 记全：模式 + 阈值 + Canny low/high + target + 源路径
-    assert it.image_spec["mode"] == "canny"
-    assert it.image_spec["source"] == src
-    assert it.image_spec["threshold"] == 160
-    assert it.image_spec["low"] == 50 and it.image_spec["high"] == 120
-    assert it.image_spec["target_mm"] == pytest.approx(100.0, abs=1e-6)
+    # spec 恒有的三项：模式 + 最长边 + 源路径
+    spec = it.image_spec
+    assert spec["mode"] == mode
+    assert spec["source"] == src
+    assert spec["target_mm"] == pytest.approx(100.0, abs=1e-6)
+    # 该模式**真的生效**的产线参数
+    for k, v in used.items():
+        assert spec[k] == v, f"{mode} 的 spec 应记生效参数 {k}={v}"
+    # 该模式**从未参与产线**的字段：一个都不许残留
+    for k in unused:
+        assert k not in spec, (
+            f"{mode} 模式下 {k} 从未参与产线，留在 spec 里就是假信息"
+            f"（实得 {sorted(spec)}）")
     lp.deleteLater()

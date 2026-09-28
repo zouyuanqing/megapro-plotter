@@ -8,8 +8,14 @@
   锚点绝对坐标），保相对布局。
 - 拖动中只临时 setScale/setRotation/setPos；``mouseRelease`` 一次性 push
   :class:`~megapro.gui.canvas.undo_cmds.ChangeItemPropsCommand`（old,new）。
-- 手柄恒定屏幕大小：每帧 ``setScale(1/ppm)``（不用 ItemIgnoresTransformations
-  —— Qt 文档警告该 flag 下坐标/碰撞必须走 deviceTransform）。
+- 手柄恒定屏幕大小：``setScale(1/ppm)``（不用 ItemIgnoresTransformations
+  —— Qt 文档警告该 flag 下坐标/碰撞必须走 deviceTransform）。**ppm 变了就得
+  重算**：本类在 ``__init__`` 里自接 ``PaperView.viewChanged``（唯一入口
+  ``_apply_transform``，缩放/平移/fit 都走它），否则手柄尺寸要漂到下一次
+  ``sync()``（= 选中变化）才对上。slot 先比缓存 ppm，平移不改 ppm 直接返回，
+  不把重算挂到「中键拖动每次鼠标移动」上。
+- 旋转手柄与选框顶边的间距同样是**屏幕** px（``_ROTATE_GAP_PX / ppm`` 场景
+  单位），否则缩小时会陷进选区。
 - 摆位用 ``sceneBoundingRect()``（boundingRect 不受自身变换影响）。
 """
 
@@ -23,6 +29,9 @@ __all__ = ["SelectionHandles"]
 
 #: 手柄标记半宽（手柄本地单位 = 屏幕 px，经 setScale(1/ppm) 恒定屏幕大小）
 _HANDLE_HALF = 5.0
+
+#: 旋转手柄中心 ↔ 选择框顶边的**屏幕**间距（px）；场景单位 = 本值 / ppm
+_ROTATE_GAP_PX = 18.0
 
 
 class _HandleItem(QtWidgets.QGraphicsItem):
@@ -75,6 +84,12 @@ class SelectionHandles:
         self._targets: list = []
         self._handles: list[_HandleItem] = []
         self._drag: dict | None = None
+        #: 上次写进手柄的 ppm（``_on_view_changed`` 的「有无必要重算」判据）
+        self._last_ppm = 0.0
+        # 手柄尺寸恒定屏幕大小 ⇒ 必须跟着视图缩放走。``viewChanged`` 由
+        # ``PaperView._apply_transform`` 发（缩放/滚轮/fit/平移的唯一汇流点），
+        # 自接在这里，不依赖 layout_page 接线。
+        view.viewChanged.connect(self._on_view_changed)
 
     # -- 摆位 ---------------------------------------------------------------
 
@@ -94,11 +109,10 @@ class SelectionHandles:
             h.setPos(pos)
             self._handles.append(h)
         rot = _HandleItem("rotate", 0, self)
-        rot.setPos(QtCore.QPointF(rect.center().x(), rect.top() - 18.0))
         self._handles.append(rot)
         for h in self._handles:
             self._scene.addItem(h)
-        self.update_sizes()
+        self.update_sizes()  # 尺寸 + 旋转手柄的屏幕间距摆位
 
     def clear(self) -> None:
         for h in self._handles:
@@ -107,11 +121,46 @@ class SelectionHandles:
         self._targets.clear()
         self._drag = None
 
+    def _view_ppm(self) -> float:
+        return abs(self._view.transform().m11()) or 1.0
+
+    def _on_view_changed(self) -> None:
+        """``PaperView.viewChanged`` 槽：缩放后手柄的屏幕尺寸必须跟上。
+
+        ``viewChanged`` 也会在 ``pan_by`` 里发（**每次**中键拖动一次），而平移
+        不改 ppm ⇒ 先比一次缓存 ppm，相同就直接返回：既不碰手柄也不做无谓
+        重算，不把这条挂到拖动路径上（PRD NFR-5：递归变换只在选择/缩放路径
+        触发）。缩放才走 :meth:`update_sizes`。
+        """
+        ppm = self._view_ppm()
+        if abs(ppm - self._last_ppm) <= 1e-12:
+            return
+        self.update_sizes()
+
     def update_sizes(self) -> None:
-        """手柄恒定屏幕大小：setScale(1/ppm)。"""
-        ppm = abs(self._view.transform().m11()) or 1.0
+        """手柄恒定屏幕大小：``setScale(1/ppm)`` + 旋转手柄的屏幕间距。
+
+        幂等；由 ``sync()``（选中/编辑后）与 ``_on_view_changed``（缩放后）
+        两条路径共用，故手柄尺寸不依赖「下一次选中变化」才对上。
+        """
+        ppm = self._view_ppm()
+        self._last_ppm = ppm
         for h in self._handles:
             h.setScale(1.0 / ppm)
+        self._relayout_rotate(ppm)
+
+    def _relayout_rotate(self, ppm: float) -> None:
+        """旋转手柄摆在选框顶边上方 ``_ROTATE_GAP_PX`` **屏幕** px 处。
+
+        场景单位随 ppm 变（``_ROTATE_GAP_PX / ppm``）⇒ 缩放视图时与手柄尺寸
+        一同重算，否则缩小后手柄会陷进选区里。
+        """
+        rot = next((h for h in self._handles if h.kind == "rotate"), None)
+        if rot is None:
+            return
+        rect = self.selection_rect()
+        rot.setPos(QtCore.QPointF(rect.center().x(),
+                                  rect.top() - _ROTATE_GAP_PX / ppm))
 
     def selection_rect(self) -> QtCore.QRectF:
         rect = QtCore.QRectF()

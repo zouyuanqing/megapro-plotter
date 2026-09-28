@@ -5,7 +5,9 @@
 - 编辑：框选/Ctrl多选/Ctrl+A、删除、撤销/重做、复制粘贴、箭头微调、
         层序（置顶/置底/上移/下移）、对齐/分布、W/H 数值
 - 画布：mm 网格、缩放控件、标尺、网格/对象吸附、旋转缩放手柄
-- 导出：另存为 SVG / 送去执行（按 z 排序、跳过隐藏）
+- 导出：另存为 SVG / 送去执行（按 z 排序、跳过隐藏）；两出口同过一道**越床闸**
+  （:meth:`LayoutPage._confirm_in_bed`：可见几何超 ``BED_W``/``BED_H`` ⇒ 默认
+  拒绝，只有显式「忽略并继续」才放行 —— 切纸机上默认放行 = 切到床外）
 
 坐标契约（阶段 2 y-up 统一，docs/preview-layout-blueprint.md §2.1/§2.2）：
 - 模型 Item 存**纸面 mm y-up**（原点左下 0..210）；**场景 ≡ 纸面**（同值），
@@ -76,6 +78,10 @@ TOOL_RECT = "rect"
 TOOL_CIRCLE = "circle"
 TOOL_POLY = "poly"
 TOOL_PENCIL = "pencil"
+
+#: 越床容差（mm）：bbox 恰好贴住床沿不算越界（数值抖动不该弹框骚扰）。
+#: 与 ``main_window._travel_problem`` / Placement 判定的 1e-6 同量级。
+_BED_TOL_MM = 1e-6
 
 
 def _svg_to_paths(svg: str) -> list:
@@ -1757,8 +1763,69 @@ class LayoutPage(QtWidgets.QWidget):
             placement=Placement(mode="preserve"),
         )
 
+    def _out_of_bed(self) -> tuple[float, list[str]] | None:
+        """当前页**全部可见**几何的越床度量；无越界返回 ``None``。
+
+        口径：``iter_units(visible_only=True)`` + ``unit_page_bbox``（带祖先链）
+        —— 裸 ``page_bbox()`` 在非恒等容器下对组内叶子报**局部**坐标 → 编组后
+        漏报（M1 缺口 #1，切纸即切到床外）。可见性同 ``flatten_visible``：
+        隐藏图元不进导出、也不参与判定（否则一个藏起来的越界件会永久堵住导出）。
+
+        床面取 :data:`BED_W`/:data:`BED_H` 常量 —— 数值字面只在 ``coords.py``
+        一处定义（§8.4），此处不得硬编码 210。
+
+        返回 ``(最大超出量 mm, 越界单元清单)``。四条边（0/BED_W × 0/BED_H）
+        同权：负方向与正方向一样是床外。
+        """
+        over: list[tuple[float, str]] = []
+        for it, chain in iter_units(self.doc.items, visible_only=True):
+            x0, y0, x1, y1 = it.unit_page_bbox(chain)
+            d = max(-x0, -y0, x1 - BED_W, y1 - BED_H)
+            if d > _BED_TOL_MM:
+                over.append((d, f"「{it.name}」({x0:.1f},{y0:.1f})-({x1:.1f},{y1:.1f})"))
+        if not over:
+            return None
+        return max(d for d, _ in over), [s for _, s in over]
+
+    def _confirm_in_bed(self, action: str) -> bool:
+        """越床确认闸：床内直接 True；越界**默认拒绝**，仅「忽略并继续」放行。
+
+        「导出并送去执行」与「另存为 SVG」共用的唯一判据 —— 两出口判据分叉
+        就是「保存时看着正常、跑刀时才发现越界」。
+
+        默认拒绝是刻意的：会动刀的软件里，「静默放行」比「多问一句」危险得多
+        （开串口即复位、软限位静默钳位、ok≠已移动 ⇒ 越界绝对 G0 不会报错，
+        只会切在纸外）。合法的「大版面」场景由「忽略并继续」覆盖，不必靠默认
+        放行来支持。
+
+        关窗（X）⇒ ``clickedButton()`` 为 None ⇒ 拒绝，与「取消」同义。
+        """
+        info = self._out_of_bed()
+        if info is None:
+            return True
+        amount, names = info
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Critical)
+        box.setWindowTitle("越界")
+        box.setText(f"{len(names)} 个图元超出床面 0–{BED_W:g}×0–{BED_H:g}，"
+                    f"最大超出 {amount:.1f}mm。")
+        box.setInformativeText(
+            "\n".join(names)
+            + f"\n\n{action}会把超出的部分切/画到床面外：可能切到夹具、撞刀，"
+              "或切在纸外。\n确认无误（自己承担后果）请点「忽略并继续」；"
+              "否则点「取消」返回修改。")
+        ignore = box.addButton("忽略并继续", QtWidgets.QMessageBox.AcceptRole)
+        cancel = box.addButton("取消", QtWidgets.QMessageBox.RejectRole)
+        cancel.setDefault(True)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is ignore
+
     def _on_save_svg(self) -> None:
         self._sync_models()
+        if not self._confirm_in_bed("另存为 SVG"):
+            return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "另存为 SVG", "layout.svg", "SVG (*.svg);;所有文件 (*)")
         if not path:
@@ -1775,19 +1842,11 @@ class LayoutPage(QtWidgets.QWidget):
 
     def _on_export(self) -> None:
         self._sync_models()
-        # 越界预检：走 :meth:`_page_box`（含祖先链）—— 裸 ``it.page_bbox()`` 在
-        # 非恒等容器下对组内叶子报局部坐标 → 编组后漏报（M1 缺口 #1）。
-        # ⚠ 已知口径（不在本里程碑范围）：此处**只警告**，随后无条件
-        # ``export_requested.emit`` —— 从不真正拦截越界导出。
-        for it, _chain in iter_units(self.doc.items, visible_only=True):
-            x0, y0, x1, y1 = it.unit_page_bbox(_chain)
-            if x0 < 0 or y0 < 0 or x1 > BED_W or y1 > BED_H:
-                QtWidgets.QMessageBox.warning(
-                    self, "越界",
-                    f"图元「{it.name}」超出 210×210 床面 "
-                    f"(bbox {x0:.0f},{y0:.0f}-{x1:.0f},{y1:.0f})。仍导出？",
-                )
-                break
+        # 越界**拦截**（C1）：判据 = :meth:`_out_of_bed`（含祖先链的页面系
+        # bbox + BED_W/BED_H 常量），确认闸 = :meth:`_confirm_in_bed`（与另存
+        # 为 SVG 同一道）。取消 / 关窗 ⇒ 不 emit —— 越界几何绝不静默送去动刀。
+        if not self._confirm_in_bed("送去执行"):
+            return
         self.export_requested.emit(self.to_job_spec())
 
 

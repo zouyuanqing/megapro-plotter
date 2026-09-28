@@ -535,9 +535,17 @@ class Item:
         下探，故多容一层。差一层不影响正确性（两者都远低于 CPython 的
         998 层递归上限，**不会**先炸成 ``RecursionError``）。
 
-        产品路径不可达（src/ 里只有 ``wrap_group`` 与 JSON 反序列化构造
-        children，JSON 语法表达不出环），所以这是**契约陈述失真**而非危险
-        bug —— 补的是「所有递归遍历都抛可诊断 ValueError」那句话的真伪。
+        产品路径**当前**不可达，但这句陈述曾漏枚举了 ``children`` 的第三个
+        构造者（A1 更正）：src/ 里能写 ``children`` 的有
+        ①``doc_import.py`` 的 ``wrap_group``（``paths=[]``、不带子项）、
+        ②``layout_page.py`` 的 JSON 反序列化（JSON 语法表达不出环）、
+        ③**``Page.attach``**（``undo_cmds.py:287/510/638/640``、
+        ``model.py:801/830/832/960`` 共 8 处）。①② 在语法上造不出环；③
+        此前**能**造 —— 它只挡「已是 owner 的直接子项」就无条件 ``append``，
+        故 ③ 可造真环（``attach(G, owner=其中叶子)``）与双父 DAG，且静默。
+        ③ 的自含拒绝是 A1 补上的；其既有 8 个调用点因「回插先前有效状态记录的
+        owner」而安全（论证见 :meth:`Page.attach`）。守卫仍属**契约陈述 +
+        防御性 pin**，补的是「所有递归遍历都抛可诊断 ValueError」那句话的真伪。
         """
         _check_depth(_depth)
         out = [self]
@@ -653,6 +661,40 @@ class Page:
         **入档即编号**（A4）：任何挂载都是一次入档，故先 :func:`_stamp_order`。
         编号与树形无关 ⇒ 拍平并列 z 的 tie-break 稳定（见 :func:`flatten_visible`）。
         已编号者是幂等空操作，故 undo 重挂恢复的是**原编号**、原顺序。
+
+        **成环自含拒绝（A1）**：``item`` 与 ``owner`` 不得**互为后代**（含
+        彼此本身），否则返回 ``None`` 且**不动模型**。这条守卫判的是「两者互不
+        在对方子树里」，三个并列的坏形状，**只查直接子项一个都挡不住**：
+
+        1. ``item is owner`` —— 挂到自己身上即自环；
+        2. ``owner ∈ subtree(item)`` —— 挂上去 ``item`` 沿链回到自己 ⇒ **真环**
+           （``attach(G, owner=其中叶子)`` 得 G→leaf→G）。这是 :data:`MAX_TREE_DEPTH`
+           守卫唯一探测得到、却在**造出环之后**才发现的形状，且**静默无告警**；
+        3. ``item ∈ subtree(owner)`` —— ``item`` 挂到 ``owner`` 下的**第二个**
+           位置 ⇒ **双父 DAG**（非环，但 :func:`iter_items` / :func:`flatten_visible`
+           会把它产出两次 ⇒ **同一几何切两遍**）。
+
+        旧实现只挡「已是 owner 的**直接**子项」（即情形 3 的最浅一格）就无条件
+        ``append``，三种都能造出来。判定与 :meth:`group_items` **对称**（那边查
+        「待编组集 ∩ 成员子树 ≠ ∅」）；本方法只查**一条**包含关系，故两个方向
+        都要查。**顶层分支（``owner=None``）刻意不加此守卫** ——
+        ``Document.add``/``Document.items`` setter 是入档通道，其「同一对象可
+        同时挂在顶层与组内」由既有测试显式钉死
+        （``tests/test_gui_layout.py::test_attach_restores_group_structure_exactly``
+        故意把一个组内叶子再 ``attach(owner=None)`` 造双父，断言的是**顶层列表
+        计数**）。守卫只装在 ``owner`` 给定的分支上。
+
+        拒绝与既有的「身份幂等」短路**同样返回 None、不抛异常**：两者对调用方
+        都是「别挂」，无法也不必区分。⚠ 若任一方的子树**已经**是环（数据已损坏），
+        :meth:`Item.descendants` 会撞深度守卫抛可诊断的 :class:`ValueError` ——
+        与 :meth:`group_items` 的同款契约：那不是「自含被拒」，是「模型已损坏」。
+
+        现有 8 个调用点全部安全（故本守卫不改变它们的可观测行为）：它们回插的
+        ``owner`` 都取自**先前有效状态**记录的 :class:`DetachInfo`／原 owner
+        （``undo_cmds.py:287/510/638/640``、``model.py:801/830/832/960``）——
+        记录产生时树无环，且 undo 序列只做「摘出 → 原样挂回」，没有任何一步会把
+        owner 挪进被挂项的子树、或让被挂项仍挂在 owner 底下。回归见
+        ``tests/test_gui_layout_attach_cycle.py``。
         """
         if owner is None:
             if any(cur is item for cur in self.items):
@@ -664,7 +706,13 @@ class Page:
                 self.items.insert(index, item)
             return
         if any(ch is item for ch in owner.children):
-            return
+            return          # 身份幂等：已是 owner 的直接子项（既有语义，不动）
+        # A1：三者互为后代即拒。叶子无子树 ⇒ ``X.descendants()`` 就是 ``[X]``，
+        # 对应那一格已被上面两条覆盖，故只在有子项时才真去遍历。
+        if (item is owner
+                or (item.children and any(d is owner for d in item.descendants()))
+                or (owner.children and any(d is item for d in owner.descendants()))):
+            return          # 被拒：不改模型、不编号、不抛异常
         _stamp_order(item)
         if index is None or not (0 <= index <= len(owner.children)):
             owner.children.append(item)
@@ -739,7 +787,9 @@ class Page:
           遍历会撞上 :data:`MAX_TREE_DEPTH` 守卫而抛可诊断的
           :class:`ValueError` —— 那不是「自含选择被拒」，是「模型数据已损坏」。
           此前这里抛的是不可诊断的 ``RecursionError``（A5 补齐 :meth:`Item.descendants`
-          的守卫后一并解决）。产品路径不可达，见 :meth:`Item.descendants`。
+          的守卫后一并解决）。「产品路径当前不可达」的**完整**枚举（含 A1 补上的
+          第 ③ 个构造者 ``Page.attach``）见 :meth:`Item.descendants` —— 别再只数
+          ``wrap_group`` 与 JSON，那份枚举曾经不完整。
         - 成员不足 2 个 → 返回 ``None``（无意义的单元素组）。
         - 容器插入位置 = **第一个成员的原位置**（owner + 下标）。
         - **顶层列表序的复原范围**：**相邻**成员编组再解组 ⇒ 顶层序精确复原

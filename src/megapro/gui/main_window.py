@@ -116,6 +116,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._job_spec: JobSpec | None = None
         self._job_compiled = None  # CompiledJob | None
         self._job_lines: list = []  # 将发送的 lines（= _job_compiled.lines 拷贝）
+        #: 作业页当前握的作业**是否来自排版页**（B2 静默同步的来源门禁）。
+        #: 只在「谁把它放进作业页」的那一处翻转：排版两条路
+        #: （:meth:`_on_layout_export` / :meth:`_on_layout_job_sync`）置 True，
+        #: 文件载入（:meth:`_on_load_svg`）与清空（:meth:`_on_clear_job`）置
+        #: False；``_on_placement_changed`` 的 ``replace()`` 与
+        #: :meth:`_recompile` 的参数投影**不**改它（同一次作业，只换字段）。
+        #:
+        #: ⚠ **不用 ``source_name == "排版版面"`` 当来源标记**（B2 已实测顶掉
+        #: 用户作业）。那个字符串是**给用户看的显示名**
+        #: （:meth:`_update_job_info` 直接拼进作业信息行），不是契约字段；且
+        #: 文件作业的 ``source_name`` 取 ``Path(path).name``，而载入对话框带
+        #: 「所有文件 (*)」（main_window.py:1465）⇒ 一个**无扩展名、恰好叫
+        #: 「排版版面」**的文件会与排版作业撞名，静默同步随即把它接管。布尔
+        #: 门禁在构造上就没有这个洞。
+        self._job_from_layout = False
         self._job_running = False
         self._running_compiled = None  # 执行开始时的不可变快照（进度高亮/发送同源）
         self._feed_xy = 1200.0  # 作业 XY 进给率 mm/min
@@ -1492,6 +1507,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         placement = self._placement_for_meta(meta)
         self._set_placement_ui(placement.mode)
+        self._job_from_layout = False   # 用户自己的文件作业 —— 不是排版的
         self._job_spec = JobSpec(
             paths_paper=paper_from_svg_ydown(paths_svg),
             source_name=Path(path).name,
@@ -1537,6 +1553,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(spec, JobSpec):
             self._append_console("排版导出参数无效（非 JobSpec），忽略")
             return
+        self._job_from_layout = True
         self._job_spec = spec
         self._set_placement_ui(spec.placement.mode)
         self._recompile()
@@ -1551,16 +1568,48 @@ class MainWindow(QtWidgets.QMainWindow):
         是高频动作，把用户踢回控制页并刷屏不可接受。
 
         ``_recompile`` 的触发集只是**新增**这一个点，既有触发点与语义一律
-        未改：这里没有另开编译路径（执行中仍 no-op + 提示、无作业仍提前返回、
-        参数仍由 ``_spec_with_current_params`` 投影）。
+        未改：这里没有另开编译路径（无作业仍提前返回、参数仍由
+        ``_spec_with_current_params`` 投影）。
+
+        **两道前置门禁（B2 修的就是这个 —— 此前本方法无条件
+        ``self._job_spec = spec``）**：
+
+        1. **来源门禁**：作业页当前握的**不是**排版作业（:attr:`_job_from_layout`
+           为 False，即用户自己载入的 SVG 文件作业或空作业）⇒ **整个方法
+           直接返回，一个字段都不碰**。
+           缺陷实测：作业页握 ``design.svg``（paths=1、lines=9）时切一下排版页
+           页签，作业页即被换成空排版版（paths=0、lines=4），**控制台一声不
+           吭**、按钮仍可执行 —— 用户刚载入的文件作业被无声顶掉，且无从察觉。
+           排版同步是**给排版自己的**增量刷新，不该抢别人的作业；要刷排版作业
+           请点『送去作业』（那条路本来就显式、会切页并刷控制台）。
+        2. **执行中门禁**：``_job_running`` 为真 ⇒ 与作业页参数改动**同一模式**
+           —— 打既有那句提示后返回，且**先于** ``_job_spec`` 赋值。
+           缺陷实测（另一条独立触发路径）：赋值发生在 :meth:`_recompile` 的
+           执行期守卫**之前**，于是「内存唯一源」被换掉而 lines/预览不变，
+           :meth:`_on_job_done` 的补编译遂编译**切过去那一页** —— 刚跑完的
+           作业从作业页彻底消失，下一刀悄悄换成了另一份内容。故这里必须**在
+           赋值前**就返回：``_job_spec`` 一旦被换，补编译就会拿它去编译。
+           ⚠ 沿用既有提示原文是为了与参数改动那条路**同一口径**（不另发明一套
+           措辞）；就本路径而言「结束后生效」的准确含义是：跑完后作业页保留
+           **本次实际执行的那份**作业（这正是用户要的预览），用户下次切页即重新
+           同步 —— 不会自动跟到切过去的那一页。
         """
         if not isinstance(spec, JobSpec):
             return
+        # 门禁 1：作业页握的不是排版作业 ⇒ 完全不动（含控制台，保持静默）
+        if not self._job_from_layout:
+            return
+        # 门禁 2：执行中 ⇒ 照参数改动那条路的模式，先提示、后返回
+        if self._job_running:
+            self._append_console("执行中，参数改动本次作业结束后生效")
+            return
+        self._job_from_layout = True
         self._job_spec = spec
         self._set_placement_ui(spec.placement.mode)
         self._recompile()
 
     def _on_clear_job(self) -> None:
+        self._job_from_layout = False   # 作业没了 ⇒ 无来源可言
         self._job_spec = None
         self._job_lines = []
         self._job_compiled = None

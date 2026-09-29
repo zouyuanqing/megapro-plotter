@@ -1480,7 +1480,27 @@ class LayoutPage(QtWidgets.QWidget):
         else:
             cursor = None
         changes = []
-        for unit, _ in self._selected_units():
+        units = self._selected_units()
+        if cursor is not None:
+            # ⚠ **跨单元的相对次序必须由文档决定，不能由 Qt 决定**（R7）。
+            # :meth:`_selected_units` 走 ``scene.selectedItems()``，返回顺序
+            # **无保证**——同一场景跨进程实测 12 次出现 5 种次序；而 top/bottom
+            # 的游标是**按迭代顺序**分配的（``cursor += 1``），于是同一个操作在
+            # 两次启动里会发出**不同的切割次序**给机器::
+            #
+            #   units=['G','M2'] ⇒ M0=51,M1=52,M2=53 ⇒ 切 ['X','M0','M1','M2']
+            #   units=['M2','G'] ⇒ M0=52,M1=53,M2=51 ⇒ 切 ['X','M2','M0','M1']
+            #
+            # 两条都满足「连续段 + 不与未选中交叠 + 组内相邻」，所以既有三条
+            # 断言抓不住它——被刻意放开的那个量恰好就是发往机器的切割次序。
+            # 穿同一片叠料的两刀先后是可观测的切割结果。
+            #
+            # 故按各单元的 **min(叶子 z) 稳定排序**后再铺开：top/bottom 都保持
+            # 选中前的相对层序（FR-06 的整组连续不受影响，只是不再被 Qt 的
+            # 返回序打乱）。稳定 ⇒ 并列 min z 时仍沿用原顺序，不引入新的乱序。
+            units.sort(key=lambda uc: min(
+                (it.z for it in self._leaves_of_unit(uc[0])), default=0.0))
+        for unit, _ in units:
             leaves = self._leaves_of_unit(unit)
             if not leaves:
                 continue

@@ -1604,8 +1604,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_console("执行中，参数改动本次作业结束后生效")
             return
         self._job_from_layout = True
+        # ⚠ **placement 归用户所有，静默同步不得重置**（R6）。
+        # :meth:`LayoutPage.to_job_spec` 恒返回 ``Placement(mode="preserve")``，
+        # 而本方法原先照搬 :meth:`_on_layout_export`（那是**显式**『送去作业』，
+        # 重置 placement 合理）的整条语义、含 ``_set_placement_ui`` ⇒ 用户在
+        # 作业页亲手选的『锚点归位 bl→(0,0)』会被排版页的**任何一次**编辑
+        # （微调/层序/撤销…）无声打回『保持版面坐标』，整刀内容沿 X 平移
+        # 54mm、Y 平移 50mm。实测：控制台零提示、run 门禁全绿、
+        # ``runnable=True``，机器真会收到偏移后的坐标。
+        #
+        # 故：把用户当前的 placement **投影回**新 spec（与
+        # :meth:`_spec_with_current_params` 对其余参数的做法一致），combo
+        # 一律不碰。只有来源切换（送去作业 / 载入文件）才重置 placement 下拉。
+        spec = replace(spec, placement=self._job_spec.placement)
         self._job_spec = spec
-        self._set_placement_ui(spec.placement.mode)
         self._recompile()
 
     def _on_clear_job(self) -> None:

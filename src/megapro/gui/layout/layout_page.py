@@ -695,7 +695,35 @@ class LayoutPage(QtWidgets.QWidget):
         canvas_box.setRowStretch(1, 1)
         canvas_box.setColumnStretch(1, 1)
         root.addLayout(canvas_box, 1)
+        root.addWidget(self._build_status_line())
         root.addWidget(self._build_props())
+
+    def _build_status_line(self) -> QtWidgets.QLabel:
+        """**页内**提示行：把 :attr:`status_message` 落在用户眼前（R9）。
+
+        为什么必须有它：``status_message`` 的生产连接只有一条 ——
+        ``MainWindow`` 把它接到 ``_append_console``，而 console 在**「控制 / 作业」**
+        页签里。用户点镜像/双击图元时人在**「排版 / 制作」**页签，于是提示被
+        写进一个 ``isVisible() == False`` 的控件：代码确实「出声」了，用户看到的
+        仍是沉默（实测：无选中点镜像 → console 多一行「未选中图元：请先选中要
+        镜像的图元」，而那一刻它在另一个页签里）。
+
+        本行是本页自己的落点，**常驻可见**；console 那条连接保留（作业页/复盘
+        仍需要），但不再是唯一落点。文字样式沿用仓库其它 QLabel，不另造外观。
+        """
+        self.status_label = QtWidgets.QLabel("", self)
+        self.status_label.setObjectName("layoutPageStatus")
+        self.status_label.setToolTip("本页最近一次操作提示（与作业页控制台同一来源）")
+        self.status_message.connect(self._show_status)
+        return self.status_label
+
+    def _show_status(self, text: str) -> None:
+        """把 :attr:`status_message` 的文本写到页内提示行。
+
+        不自动消失：状态行显示「最近一次提示」是常规语义，而自动消失会让测试与
+        用户都错过它。下一条提示自然覆盖上一条。
+        """
+        self.status_label.setText(str(text))
 
     def _build_page_bar(self) -> QtWidgets.QWidget:
         """页签条（FR-09）：页签 + 增/删/复制/左移/右移 + 作业预览同步开关。

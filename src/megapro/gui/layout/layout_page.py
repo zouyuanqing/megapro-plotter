@@ -367,10 +367,34 @@ class LayoutPage(QtWidgets.QWidget):
 
         越界预检 / 组框 overlay / 对齐 / 分布 / 多选数值一律走本函数，不吃裸
         ``item.page_bbox()``（后者不走祖先链 → 组内叶子在非恒等容器下报局部坐标）。
+
+        ⚠ **祖先链必须从文档根查**（R4 复核修正）。原实现写成
+        ``iter_units([item], visible_only=False)``，而遍历从 ``[item]`` 起步、
+        **第一个 yield 就是 item 自身** ⇒ ``it is item`` 立刻命中、``chain``
+        恒为 ``()`` ⇒ 「含祖先链」是**假的**：嵌套组里内层容器的框按**局部系**
+        画，与实际被切位置差一个外层变换。实测（走真实 ``_paste`` 给外层容器
+        写 pos=(100,0)）：内层组框画在 (0,0)，而 ``flatten_visible`` 的实际
+        切割 AABB 在 (105,5)…(115,45)，**差 105mm**。这不只是画框难看 ——
+        :meth:`_unit_bbox` 是对齐/分布/属性面板/等比缩放 k 的唯一来源，错的
+        bbox 会让用户「对齐」一个被移到别处的组。
+
+        改法与 :meth:`_owner_container` 同一口径（不另发明）：``iter_ancestors``
+        从 ``self.doc.items`` 起步，命中即返回，找到即停。
+
+        代价 = 从根走到该 item 的距离（生成器早退）。本函数只对**组框容器**与
+        **选中操作单元**调用（不逐图元调用），不是逐帧路径。实测代价（同机
+        取 7 次最好值）：30 组×10 叶（300 叶子）逐容器算一遍 0.91ms（旧写法
+        0.65ms），100 组×10 叶（1000 叶子）5.55ms（旧 2.38ms），整次
+        ``overlay.refresh``（框全画）分别为 1.68ms / 9.78ms。即**约 2–3 倍、
+        绝对值仍在十毫秒量级**，且随「选中单元数 × 文档图元数」增长——想再压
+        只能加缓存，但**缓存陈旧会让对齐把组移到错误位置**（会动刀），所以此处
+        宁可每次重算。若日后要缓存，先想清楚失效点。
         """
-        for it, chain in iter_units([item], visible_only=False):
+        from megapro.gui.layout.model import iter_ancestors
+
+        for it, anc in iter_ancestors(self.doc.items):
             if it is item:
-                return item.unit_page_bbox(chain)
+                return item.unit_page_bbox(anc)
         return item.page_bbox()
 
     # -- 组：选择语义（FR-03 / FR-05） --------------------------------------

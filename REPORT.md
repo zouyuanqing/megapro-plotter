@@ -400,3 +400,267 @@ pitch 联动/数值输入撤销合并」本树已实现（见 10.1 #10 回归列
   上看出次序，本轮夹具四条线几何全同（`(0,0)-(10,0)`），只有 z 序证据。
 - 其余沿用 11.5 / 10.4：Frame 与预览 bbox 目视一致、设原点后落笔对准 <1mm、
   空跑不触纸、贴纸镜像翻面转印、Canny 真实照片调参。
+
+---
+
+# 2026-09-29 交付收口记录（续：第 6–16 轮，`0f9a542` → `67883e8`）
+
+> 本节由**文档收口会话**写：那一轮的任务是「把技术状态写进文档，不改代码」。
+> 所以本节的形态与 §14 不同 —— 主体是**核验与复测**：对每一批已交付的修复，
+> 在当前树上重新取证（能复现的写复现，不能复现的明写「未复现」），并把
+> §14.3 那份缺口清单按当前实现逐条重判。
+> **本轮未改动任何 `.py`**（`git status` 只有四份文档）。
+
+## 15.1 核验方式（可复现）
+
+- **定向回归**（本会话实跑）：
+
+  ```sh
+  PYTHONPATH=src python -m pytest -q --basetemp=.pytest_tmp/doccheck/bt \
+    -p no:cacheprovider \
+    tests/test_gui_layout_bounds_gate.py \
+    tests/test_gui_layout_own_geometry_ingest.py \
+    tests/test_gui_layout_group_ownership.py \
+    tests/test_gui_layout_ungroup_undo.py \
+    tests/test_gui_layout_recompile_atomicity.py \
+    tests/test_gui_layout_status_visibility.py \
+    tests/test_gui_layout_toolbar_feedback.py \
+    tests/test_gui_layout_ancestor_chain_box.py \
+    tests/test_gui_layout_sync_placement_ownership.py \
+    tests/test_gui_layout_zorder_cut_order.py
+  ```
+
+  → **106 passed, 5 skipped, 3470 warnings in 0.98s**。
+  ⚠ **全量 `pytest -q` 本会话未跑**（按本轮约定，全量门禁由脚本统一跑），
+  所以「全仓多少 passed / 多少 xfailed」**未经本会话实测**。
+
+- **取证探针**：11 个独立脚本，写在 `.pytest_tmp/doccheck/`（`p1.py`–`p11.py`），
+  独立脚本需在 `import PySide6` **之前**
+  `os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")` 并
+  `sys.path.insert(0, r"D:\mcu_prj1\src")`。走的是**真控件路径**：
+  真 `QToolButton.click()`、真 `QUndoStack`、真 `QApplication.clipboard()`、
+  真 `_paste`、真 `run_btn.click()`，不是直调内部方法。
+  取证用完后已删除（`.pytest_tmp/` 本身是 git-ignore 的临时目录）。
+
+## 15.2 销账的缺口（§14.3 的九条里，四条已修 / 一条改写 / 四条仍在）
+
+| §14.3 旧编号 | 现状 | 证据 |
+|---|---|---|
+| #1 执行中删页 | **仍在** | 实测：送出作业 X=[100,140] → 执行中删页 → `jobDone` 后**仍是 [100,140]**、`run_btn` enabled |
+| #2 执行中几何编辑 | **仍在** | 实测：执行中加含 X=50 的线 → `jobDone` 后**仍是 [100,140]**，控制台仍打「本次作业结束后生效」 |
+| #3 编组/解组撤销往返 | **仍在**，症状与旧描述逐位一致 | 实测：重做回顶后 `undoText()=='解组'` 而文档是编组态；再撤一次出 `[('组3',), ('组3',['a','b','c'])]`；撤到底折线归 0 而模型留 `[('组3',),('组3',)]` |
+| #4 「置于底层」与未选中同 z | **仍在**，形状与旧描述逐位一致 | 实测：X(z=1) M0(z=2) M1(z=3) Y(z=4)，选 M0+M1 置底 ⇒ `M0=0.0, M1=1.0`，未选中的 **X 仍 1.0** ⇒ 切割序 `[10,0,20,40]`，X 被切在两选中件中间 |
+| #6 带自身折线的容器 | **已修**（入档口整单拒绝 + 中文提示） | 实测粘贴自带折线的容器 ⇒ `doc.items==[]`、提示 1 条。`layout_page.py:217` 新增 `OwnGeometryContainerError`，`:251` 判定、`:1398`/`:1421` 捕获 |
+| 旧 §12 `_page_box` 丢祖先链 | **读侧已修** | `layout_page.py:393` 改走 `iter_ancestors(self.doc.items)`；`test_gui_layout_ancestor_chain_box.py` 6 用例在 106 passed 里。**但写侧没跟上 → 新缺口，见 §15.4** |
+| 旧「排版页零提示通道」 | **已加常驻提示行** | `layout_page.py:711` `_build_status_line()`，`:730` `_show_status`。**但提示行自己有两个新问题，见 §15.3** |
+| 旧「工具条 8 个静默按钮」 | **已接中文提示** | `_zorder:1520` / `_align:1578` / `_distribute:1610` / `_delete_selected:1371`。**但键盘入口与页签条没跟上，见 §15.3** |
+| 旧「组内图片双击判据分叉」 | **已统一为真值** | `layout_page.py:532` 改为 `if getattr(item,"image_spec",None):` |
+| 旧「编译失败半提交」 | **状态原子性已修** | `main_window.py:1561` `_set_job_and_recompile`；`_recompile:1855` 返回 bool。**但四个调用方都不看返回值，且它把「执行中 no-op」也当成失败 → 新缺口，见 §15.4** |
+| 旧「组套组画 0 个框」 | **已修** | `_complete_groups`（`group_overlay.py:108`）走 `iter_units` + 叶子传递闭包；`test_gui_canvas_group_nested.py`(7) + `test_gui_canvas_group_overlay_nested.py`(9) 在 106 passed 里。**但判据单次成本涨了，见 §15.6** |
+
+## 15.3 旧 §14.3 未列、**本轮新查出**的缺口（按对机器的后果排序）
+
+以下每条都标了触发条件。完整措辞见 `AGENTS.md`「已知缺口」A/B 组。
+
+**A 组 · 会动刀**
+
+1. **组编辑态下改宽/改缩放/对齐，把整组瞬移到原点**（第 9 轮 `_page_box` 修好
+   **读侧**后的配套缺口）。`_apply_size`(`:1249`) 多选分支用页面系锚点
+   `anchor_point(u)` 算 `it.pos`（**局部系**）回写。实测：真 `_paste` 造两层
+   容器（外层 `pos=(100,0)`）→ 双击进组选 a/b → 属性面板填宽 20 ⇒ 切割 AABB
+   `(105,5)-(115,55)` → **`(0,0)-(20,100)`**，叶子 `pos` 变 `(-105,-5)`，
+   `_out_of_bed()` 返回 `None`（全在 210 床内）、`status_message` **零条**。
+2. **画布画的坐标 ≠ 导出/切割的坐标**。渲染只施加叶子**自身**变换
+   （`canvas/items.py:90`），从不施加祖先变换。实测：同一份两层容器文档，
+   画布 PathItem 在 `(0,0) 10×10`，导出/切割 AABB 在 `(105,5)-(115,15)`，
+   **差 105mm**。纯 UI 也可达（编组 → Ctrl+C → Ctrl+V，`dz=5` 让副本在画布上
+   与原件完全重合，而副本会被切在 5mm 外）。
+3. **「锚点归位」把越床几何洗进床内；静默同步这条路根本没有越床闸**。
+   `_maybe_emit_job_sync`(`:806`) 只看开关，`_on_layout_job_sync`
+   （`main_window.py:1589`）只有来源 + 执行中两道门禁，`_confirm_in_bed` 的调用点
+   只有 `_on_save_svg` 与 `_on_export`。实测（真控件：床内方块 → 送去作业 →
+   作业页选『锚点归位 bl→(0,0)』→ 回排版页属性面板把 X 键入 -40）：
+   `_out_of_bed()` 报「超出 40.0mm」，而作业页 `runnable=True`、`violations=[]`、
+   `_job_lines` 的 X 变成 **[0, 40]**、控制台**零新增行**。显式「送去作业」此时
+   会被闸门拦下 —— 同一份版面，两条路一个禁一个放行。
+4. **锚点归位每次按整份内容重算 ⇒ 没被编辑的图元被静默搬走**。实测：两个图元
+   A(0,0) B(50,50)，选 anchor 后**只删 A** ⇒ B 落点从 (50,50) 变 (0,0)，
+   **位移 50mm**，控制台零新增行。对照组 preserve 下同样操作 B 一动不动。
+5. **执行中改放置模式被永久丢弃**（第 13 轮原子包装的配套缺口）。
+   `_set_job_and_recompile` 把 `_recompile` 的三个 `return False`（执行中 no-op /
+   无作业 / 参数非法）一视同仁当失败回滚；可执行期语义里执行中 no-op 恰恰是
+   **延迟生效**机制。实测：作业跑着把下拉切到『锚点归位 bl→(0,0)』（combo 执行期
+   未禁用、`layout_page.py` 里 `_job_running` 出现 0 次）⇒ 执行中与 `jobDone` 后
+   `spec.placement` 均为 `preserve`、`_job_lines` X 不变 ⇒ 用户改的放置**永久
+   蒸发**，而 combo 停在「锚点归位」与模型长期不一致。同一次执行中改 `feed`
+   是**生效**的（走字段 `_feed_xy` 不走 spec）—— 同一触发集两种待遇。
+6. **层序「组内相对次序」在 top/bottom 会被翻转**。游标铺开走 `iter_leaves` 的
+   DFS 先序，拍平口径是 `(z, order)` ⇒ 组内 children 文档序与 z 序相反时会翻转。
+   实测：X(z=3) 先画、Y(z=2) 后画 → 编组（children 文档序 `[X,Y]`）→ 选整组置顶
+   ⇒ children z 变 `[X=4, Y=5]`，**切割序从 `[Y, X]` 翻成 `[X, Y]`**。
+   `layout_page.py:1545-1547` 的注释写的是「top/bottom 都保持选中前的相对层序」
+   —— 跨单元口径成立、组内口径被证伪。纯 UI 可达。
+7. **层序「跨单元相对次序」在 min(z) 并列时仍由 Qt 决定**。排序键只有
+   `min(叶子 z)`、无次序键，`list.sort` 稳定 ⇒ 并列时沿用
+   `scene.selectedItems()` 的无序返回。Word/Excel 导入（`layout_page.py:1891`
+   `_add_doc`）给全部条目写同一个 z ⇒ 并列真实存在。
+   **诚实标注**：构造并列场景连跑 **6 个独立进程，本机 6/6 返回同一序** ⇒
+   **分叉未在本机复现**；代码层面的口径缺口成立，跨启动分叉这一步本轮**未取得
+   证据**。
+
+**B 组 · 会静默吞操作 / 说谎**
+
+8. **剪贴板可灌入超深模型树**（旧 §14.3 的第 7 条，本轮重新定量）。实测：深度
+   63 通；**深度 64 静默入档**、`to_job_spec()` 抛 `ValueError`（该异常发生在
+   `QUndoStack.indexChanged` 触发的 Python 槽里，被 PySide6 吞成 stderr
+   traceback，**控制台零提示**），文档里从此留了一棵永远导不出的树；**深度 65
+   直接从 `_paste` 抛出**（`self.doc.top_z()` 那一行，未捕获），排版页从此粘不进
+   任何东西。入档口只捕 `OwnGeometryContainerError`，`paths: null` /
+   `children: null` / `children: [null]` 同样未捕获地抛出、同样零提示。
+9. **属性面板键入非正宽/高：静默 return，面板与真实 AABB 反号**。实测：真实 AABB
+   宽 20mm 的图元键入 -10 ⇒ 面板显示 `-10.0`、真实 AABB 仍 20.0、scale 仍 1.0、
+   `status_message` 零条。**这是最响的数字谎言** —— 它正是用户拿去预测「切多宽」
+   的那个数。提示行已经在页内了，**只是这根线没接**。
+10. **页内提示行：长消息被裁掉后半截**。它是 `QLabel` 且**没开 wordWrap**
+    （`_build_status_line` 只做 setObjectName + setToolTip + setText），宽度由
+    整条未折行文本撑开。实测（真 MainWindow，1000px 窗口）：97 字的中文拒收提示
+    `sizeHint` 宽 1164px、实际只分到 **696px（59.8%）**，被切掉的正是
+    「…已整单撤销粘贴，请确认剪贴板内容。」；排版页 `minimumSizeHint` 宽被顶到
+    **1182px**。图元名完全由剪贴板控制（`_item_from_json:262` `name=d.get("name","item")` 原样带出、
+    零长度校验），名字一长就从「丢行动句」升级到「丢解释句」。
+11. **提示行只会被下一次 `status_message` 改写，而成功路径不发 emit** ⇒ 成功之后
+    那行会长期停在与模型相反的陈述上。实测：无选中点「水平镜像」→ 提示行
+    「未选中图元：请先选中要镜像的图元」；随后选中该图元**再点一次** → 镜像
+    **真的成功了**（`mirror_x=True`、按钮勾上、几何翻了），提示行**一字未变**。
+    镜像成功分支（`:1466`）与 `_exit_group_edit`（`:539`，Esc 可达）都不发 emit。
+12. **`_align` 在「本来就对齐」时空转但仍 push 一条恒等命令**。`:1598` 无条件
+    append change（对比 `_zorder:1565` 的 `if it.z != nz` 守卫）。实测：两个
+    min-x 相同的图元点「左对齐」⇒ 几何零变化、提示行空、`undo.index()` 1→2、
+    `undoText()` 变「对齐」。后果：用户接下来撤掉真正的「置顶」后，**第二次
+    Ctrl+Z 被这条什么都没发生的命令吃掉** —— 这正是旧 §14.3 第 15 条描述的症状的
+    **新实例**。
+13. **页签条 ◀/▶ 在边界上纯静默**。`_move_page:875` 裸 return，同一行的「－」
+    （`:843`）发「至少保留一页」。实测四种边界情形全部 `status_message` 零条、
+    页序真的没动；五个页签条按钮 `isEnabled()` 全 True、`toolTip()` 全空。
+    **不影响切割**（页序不决定当前页几何与作业内容），是纯交互诚实性缺口。
+14. **Ctrl+C 无选中时把用户剪贴板覆写成 `"[]"`**。`_copy_selected:1373` 无
+    `if not units` 守卫，最后一行 `clipboard().setText(...)` 无条件执行。
+    实测：剪贴板里先放用户自己的文字，无选中按一次 Ctrl+C 就被换成 `[]`，
+    提示行零条、页面零变化；紧接着 Ctrl+V 也是静默。同类还有 Ctrl+D
+    （`_duplicate:1409`，实测无选中 msgs=[]）。
+15. **`image_spec` 真值 ≠ dict；`text_spec` 会遮蔽 `image_spec`**。①
+    `retrace_image_item`（`:2051-2052`）的 `spec.get("source")` **在 `try:`
+    （`:2061`）之外** ⇒ 真值-非-dict（`0.5`/`"nope"`/`[1,2]`）在第 2 次双击时抛
+    `AttributeError` 逃出事件处理器，既不开对话框也不发 status_message。
+    ② `canvas/items.py:161-163` 的 `text_spec` 分支**排在** `image_spec` 分支
+    （`:166`）之前且各自 return ⇒ 两键同存时提示说「再双击一次即可重追调参」，
+    第 2 次双击进的却是文字编辑器；接受后 `EditTextCommand`
+    （`undo_cmds.py:420-422`）只写 paths + text_spec，**不写也不快照
+    image_spec** ⇒ 几何已是文字轮廓却仍自称「已追图片」。**需外部载荷**
+    （UI 造不出 `image_spec`）。
+
+## 15.4 本轮同时查出：**修好一条、却带出一条新的**（两条都在本轮新写的代码里）
+
+- `_page_box` 祖先链（第 9 轮）修好**读侧**后，**写侧**（`_apply_size` /
+  `_apply_scale` / `_align` 写 `it.pos`）仍是容器局部系 ⇒ §15.3-A-1。
+- `_set_job_and_recompile`（第 13 轮）修好状态原子性后，把 `_recompile` 的
+  **执行中 no-op** 也当成「编译未成」⇒ §15.3-A-5。
+
+两条都**不是**上一版代码的旧问题；给它们单独记账是为了让下一个人知道这是
+「新代码引入的」，而不是历史遗留。
+
+## 15.5 **测试本身**钉不住的地方（本轮最该写下的一类）
+
+绿灯不等于已验证。以下每条都是「测试全绿，但它钉的不是会出错的事」：
+
+1. **`test_gui_layout_bed_vacuum.py` 对真正做决定的那个函数失明**。它用 AST
+   关口保证「把闸门接到 `doc.page.bed_*` 必须报红」，但只 `inspect.getsource`
+   了 `LayoutPage._out_of_bed`（`:205`）与 `LayoutPage._on_save_svg`（`:237`）；
+   而**发不发 `export_requested` 由 `_confirm_in_bed`（`layout_page.py:2150`）
+   的返回值决定** —— 它只被断言「`_on_save_svg` 调用了它」（`:243`），从不被
+   调用、也从不被解析。**判定函数一挪位置，整套关口失明。**
+2. **`test_gui_layout_zorder_cut_order.py` 的「切割次序」断言是空的**。
+   `_cut_order(doc)`（`:59-66`）先把 `flatten_visible` 的 x 收成**集合**，再按
+   `iter_leaves` 的 DFS 序吐名字 ⇒ 永远返回**文档序**，对次序零敏感。真正承重的
+   是那些 z 字典比较。
+3. **`test_gui_layout_order_vs_baseline.py` 的两条**。①
+   `test_group_ungroup_does_not_decouple_order`（`:267`）写
+   `a, c = doc.items[0], doc.items[1]`，而 `_fresh(*_ABC)` 建的是 `[a,b,c]`
+   ⇒ 变量名叫 `c` 的握着 **b**，编的是**相邻**的 `[a,b]`；相邻对的 DFS 先序本来
+   就稳定 ⇒ 把 A4 的 tie-break 退回 `key=z` 时它照样绿。②
+   `test_decoupling_never_pushes_geometry_outside_the_bed` 的越床半段
+   （`:195-201`）把要移动的 `wide` 构造成**末位** ⇒ `remove + add` 是空操作
+   ⇒ 那一半恒真。另：该文件 docstring 写「今天没有 UI 可达路径：生产里 undo
+   侧一律走 `attach(owner, index)` 原位复原」—— **这半句不成立**：编组的撤销走
+   `Document.ungroup`（`undo_cmds.py:553`），它用**递增下标**回插
+   （`model.py:889` 的 `Page.ungroup` 自己写了「非相邻成员编组再解组 ⇒ 顶层序
+   不可复原」），所以「工具条编组 → Ctrl+Z」就能造出脱钩文档。
+4. **`test_gui_layout_toolbar_feedback.py` 的「整条工具条不再有静默按钮」是假的**。
+   parametrize 挂在一份**手写字典** `_TOOLBAR_GUARDS`（`:61`）上，测试从不读
+   `_build_toolbar`；方向只有 `guards ⊆ toolbar`，没有 `toolbar ⊆ guards`。
+   运行期枚举工具条 32 个 QToolButton，字典覆盖 8 个。
+5. **`model.py` 四处 + 两份既有测试仍**无条件**声称「对无 children 的文档逐位
+   不变」**（`model.py:42`、`:214`、`:1331`、`:1417`；
+   `test_gui_layout_bed_enum.py:359/377`、
+   `test_gui_layout_bed_enum_structural.py:281`）。但「无 children」只是**必要**
+   条件：零 children 的扁平文档同样可以 `order ≠ 列表序`（已编号的对象被 `remove`
+   后用 `doc.add` 重新入模），此时枚举面与切割序**分叉**（几何多重集守恒，只有
+   次序变）。这与 `test_gui_layout_order_vs_baseline.py` 新写的「只在 order ==
+   列表位置时成立」**互相矛盾**。生产 undo 侧走 `attach(owner, index)` 原位回插
+   ⇒ **今天无 UI 可达路径**，属文档层不一致，不是现网 bug。
+6. **`test_gui_layout_status_visibility.py` 只钉「有个 QLabel + 文本对 +
+   `isVisible()` 为 True」**。`isVisible()` 对被 clamp 成 20px 宽的控件同样返回
+   True（探针实测：192px 中文塞进 20px 框仍 `isVisible()==True`）⇒ §15.3-B-10 /
+   B-11 它一条都抓不住。
+7. **`test_gui_layout_image_spec_predicate.py` 的不变量把 `retrace_image_item`
+   打成桩** ⇒ 函数体零执行；文件 docstring 写的「真的触发重追**或报错**」那半边
+   从未被检查（唯一正例 fixture 真跑时兑现的是 `:2053` 的「无法重追」警告）。
+8. **两处 docstring-only 交付**（`layout_page.py` 的 `_out_of_bed` 口径注、
+   `to_job_spec` 的 order 说明）在**修复前的源码树上同样全绿** —— 其回归文件钉的
+   是早已成立的现状，与那两段散文无实质耦合。按本轮「测试在修复前必须失败」的
+   规矩，这类交付不满足条件。
+
+## 15.6 性能（新记，契约未覆盖）
+
+- **组框判据从 O(#顶层容器) 变成 O(Σ子树点数)**（第 1 轮引入）。`_complete_groups`
+  （`group_overlay.py:129`）对每个容器调 `iter_leaves`，而 `iter_leaves`
+  （`model.py:1344`）搭在 `iter_flattens`（`:1273`）上、对子树里每条折线急切做
+  变换。**本轮实测**：30 组×10 叶×800 点（24 万点）文档上单次判据 **49.5ms**
+  （1.65ms/容器）。与已记账的「缩放白做重扫」同类但位置不同
+  （`group_overlay.py:129` vs `handles.py:152`），**无契约钉住**。
+  第 3 轮已把「一次手势算 N 次」压成 1 次，但 **Ctrl+A 全选仍是裸循环**
+  （`layout_page.py:1329-1332`），同规模下仍是秒级手势。
+
+## 15.7 验证结果（2026-09-29 文档收口会话实跑）
+
+- 定向 10 文件回归 → **106 passed, 5 skipped**（命令见 §15.1）。
+- **全量 `pytest -q` 本会话未跑**（本轮约定由脚本统一跑全量门禁）。
+- 4 组 strict xfail 契约的标记**仍在**（`grep -rn xfail` 于
+  `test_gui_layout_attach_reparent.py` / `test_gui_layout_tree_writer_enumeration.py`
+  / `test_gui_canvas_zoom_geometry_rescan.py` /
+  `test_gui_canvas_drag_zoom_handle_consistency.py` 均有命中）——
+  ⚠ **本会话只确认了标记存在，没有重跑这四个文件看它们是否 xfail**。
+- 11 个取证探针见 §15.1；探针与 basetemp 跑完已清理。
+- **本轮未改动任何 `.py`**。
+
+## 15.8 必须现场验收（本轮全部**未**上真机）
+
+§15.2 复现的 4 条与 §15.3 的 15 条**全部是 offscreen Qt 模拟层**（真
+`LayoutPage` / 真 `MainWindow` / 真 `QUndoStack` / 真 `QToolButton.click()` /
+真剪贴板，**但无串口、无电机、无纸面**）。上真机需要的条件与待验项：
+
+- **作业页滞留 / 编辑丢弃 / 锚点绕过越床 / 锚点搬走图元 / 放置被丢弃**
+  （§15.2 前两行、§15.3-A-3/4/5）：需一次完整作业执行 + 作业期间切排版页
+  交互 + 串口回包。待验的是**刀实际落在哪**、画布内容与 G-code 是否一致。
+- **组编辑态瞬移 / 画布≠导出**（§15.3-A-1/2）：需拿一张**几何不同**的图元
+  （不同长度/端点）在纸面肉眼比对，本轮只验到坐标层面。
+- **置底与组内次序**（§15.2 第 4 行、§15.3-A-6）：需纸面证据；本轮只有 z 序与
+  `flatten_visible` 序。⚠ 旧 §14.5 已记「夹具四条线几何全同」—— 本轮改用不同 x
+  起点，**几何仍全同**（都是 10mm 水平线），所以纸面仍看不出次序。
+- **撤销往返幽灵空容器**（§15.2 第 3 行）：需肉眼确认它会不会进下一刀的 G-code
+  （本轮只验到 `flatten_visible` 归 0、两个空壳仍在模型里）。
+- **提示行裁切**（§15.3-B-10）：需在**真实显示器 DPI / 真实字体**下看那条提示
+  行。本轮测的是原生 Qt 字体度量（`Microsoft YaHei UI 9pt`、CJK 12px/字），
+  不是真机窗口。
+- 其余沿用 §14.5 / §11.5：Frame 与预览 bbox 目视一致、设原点后落笔对准 <1mm、
+  空跑不触纸、贴纸镜像翻面转印、Canny 真实照片调参。

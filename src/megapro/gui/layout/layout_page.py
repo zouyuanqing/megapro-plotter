@@ -519,7 +519,17 @@ class LayoutPage(QtWidgets.QWidget):
         if owner is None:
             return False
         self._enter_group_edit(item)
-        if getattr(item, "image_spec", None) is not None:
+        # ⚠ 判据必须与**真正的消费者**同一条（R10）：`canvas/items.py` 的
+        # `PathItem.mouseDoubleClickEvent` 用的是**真值** ``if ... .image_spec:``。
+        # 这里原先写 ``is not None`` ⇒ falsy-非-None 的 spec（``{}`` / ``0``）
+        # 会被判成「图片件」并发提示「再双击一次即可重追调参」，而第 2 次双击在
+        # items.py 判 False ⇒ 穿透到 ``super().mouseDoubleClickEvent``：
+        # **既不开重追对话框、也不报任何错**（静默无响应）。可达载荷：``_paste``
+        # 对剪贴板只 ``json.loads`` 零校验、``_item_from_json`` 原样还原
+        # ``image_spec``，Ctrl+V 一段带 ``"image_spec": {}`` 的版面 JSON 即可。
+        #
+        # 故用真值判据：只承诺**重追真的会打开**的那些件。
+        if getattr(item, "image_spec", None):
             self.status_message.emit(
                 "已进入组编辑（双击进组）：再双击一次这张图片即可重追调参")
         else:

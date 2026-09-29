@@ -214,6 +214,28 @@ def _item_to_json(item: Item) -> dict:
     return d
 
 
+class OwnGeometryContainerError(ValueError):
+    """载荷里出现「组自带折线」：``children`` 与 ``paths`` 同时非空（R5）。
+
+    这种容器会**被切但不被画**：``flatten_visible`` / ``iter_units`` 把它当
+    一等单元（:func:`test_container_own_geometry_reaches_enumeration` 明确钉
+    住这个行为），而 ``canvas/undo_cmds.make_gi`` 对容器 ``return None`` ⇒ 场景
+    里没有它的 PathItem。端到端实测（真 ``_paste`` 入口）::
+
+        场景 PathItem = ['可见kid']      ← 容器自身那条线不在画布上
+        G-code        = G0 X15 Y15 / G1 X190 Y15 / G1 Z17   ← 机器照切照压
+
+    即：一条用户**看不见、也点不到删**的线进了发往机器的 G-code
+    （``runnable=True``）。删光子项后更糟——容器退回普通图元、却因
+    ``RemoveItemsCommand`` 不重建场景而始终没有 PathItem，机器每次执行仍切。
+
+    故在**入档口**拒绝：这是本仓唯一能造出该形状的通道
+    （``doc_import.wrap_group`` 产出的容器恒 ``paths=[]``）。选「拒绝 + 中文
+    提示」而不是「静默丢弃自身折线」：后者会让用户以为那条线也粘上了，而
+    机器**切得比预期少** —— 那同样是静默地做错。
+    """
+
+
 def _item_from_json(d: dict, *, dz: float, z: float) -> Item:
     """剪贴板 JSON → Item（递归）。``dz`` 偏移与 ``z`` **只施加在根上**。
 
@@ -221,7 +243,13 @@ def _item_from_json(d: dict, *, dz: float, z: float) -> Item:
     ``z=top_z+1`` 行为逐位一致）；子项各自保留**序列化的原 z**（组内相对
     层序保持）。偏移只加根不逐层累加（逐层会双重偏移）。
     ``mirror_*`` 缺键（旧剪贴板内容）默认 False —— 旧内容本就无镜像概念。
+
+    ⚠ **拒绝「组自带折线」**（R5）：``children`` 与 ``paths`` 同时非空的节点
+    抛 :class:`OwnGeometryContainerError`，由调用方翻成中文提示。理由见该类
+    docstring —— 它会被切、不被画。
     """
+    if d.get("children") and d.get("paths"):
+        raise OwnGeometryContainerError(d.get("name", "item"))
     pos = d.get("pos", (0.0, 0.0))
     kids = [_item_from_json(c, dz=0.0, z=float(c.get("z", 0.0)))
             for c in d.get("children", [])]
@@ -1319,11 +1347,20 @@ class LayoutPage(QtWidgets.QWidget):
             return
         items = []
         top_z = self.doc.top_z()
-        for d in data:
-            it = _item_from_json(d, dz=5.0, z=top_z + 1)
-            # 整棵子树抬到最上（散件=自身，行为与旧实现一致）
-            top_z = _restack_above(it, top_z)
-            items.append(it)
+        try:
+            for d in data:
+                it = _item_from_json(d, dz=5.0, z=top_z + 1)
+                # 整棵子树抬到最上（散件=自身，行为与旧实现一致）
+                top_z = _restack_above(it, top_z)
+                items.append(it)
+        except OwnGeometryContainerError as exc:
+            # 整单拒绝、不入档：静默丢弃会让用户以为那条线也粘上了，而机器
+            # 切得比预期少（R5）。
+            self.status_message.emit(
+                f"粘贴被拒绝：「{exc.args[0]}」是组却自带折线。"
+                "组只能装子项、自带折线的图元不会被画出却会被切，"
+                "已整单撤销粘贴，请确认剪贴板内容。")
+            return
         if items:
             self._undo.push(AddItemsCommand(self, items, "粘贴"))
 
@@ -1337,7 +1374,16 @@ class LayoutPage(QtWidgets.QWidget):
             if id(unit) in seen:
                 continue
             seen.add(id(unit))
-            clone = _clone_item(unit, dz=5.0, z=top_z + 1)
+            try:
+                clone = _clone_item(unit, dz=5.0, z=top_z + 1)
+            except OwnGeometryContainerError as exc:
+                # 与粘贴同口径：文档里若已存在「组自带折线」的形状（只能来自
+                # 入档口之外的旧状态），复制整单拒绝而不是复刻一个看不见却
+                # 会被切的容器。
+                self.status_message.emit(
+                    f"复制被拒绝：「{exc.args[0]}」是组却自带折线，"
+                    "这类图元不会被画出却会被切。")
+                return
             top_z = _restack_above(clone, top_z)   # 整棵子树都要在最上（见 _restack_above）
             items.append(clone)
         if items:

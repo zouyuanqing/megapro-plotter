@@ -1469,8 +1469,9 @@ class MainWindow(QtWidgets.QMainWindow):
             placement = Placement(mode="preserve")
         else:
             placement = Placement(mode="anchor", anchor="bl", target=(0.0, 0.0))
-        self._job_spec = replace(self._job_spec, placement=placement)
-        self._recompile()
+        self._set_job_and_recompile(
+            replace(self._job_spec, placement=placement),
+            from_layout=self._job_from_layout)
 
     def _cut_depth_mm(self) -> float:
         return float(self.cut_depth_spin.value())
@@ -1507,13 +1508,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         placement = self._placement_for_meta(meta)
         self._set_placement_ui(placement.mode)
-        self._job_from_layout = False   # 用户自己的文件作业 —— 不是排版的
-        self._job_spec = JobSpec(
+        # 用户自己的文件作业 —— 不是排版的（from_layout=False）
+        self._set_job_and_recompile(JobSpec(
             paths_paper=paper_from_svg_ydown(paths_svg),
             source_name=Path(path).name,
             placement=placement,
-        )
-        self._recompile()
+        ), from_layout=False)
         self._append_console(f"已载入 {path}")
         return True
 
@@ -1553,12 +1553,38 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(spec, JobSpec):
             self._append_console("排版导出参数无效（非 JobSpec），忽略")
             return
-        self._job_from_layout = True
-        self._job_spec = spec
         self._set_placement_ui(spec.placement.mode)
-        self._recompile()
+        self._set_job_and_recompile(spec, from_layout=True)
         self.tabs.setCurrentIndex(0)
         self._append_console("排版已送去作业页 —— 检查预览后点『开始执行』")
+
+    def _set_job_and_recompile(self, spec: JobSpec, *, from_layout: bool) -> bool:
+        """「换作业」= 赋 spec + 重编译，**原子**执行；编译不成则整体回滚。
+
+        缺陷（R8）：四条换作业路径原先都是「先 ``self._job_spec = spec``、
+        再 :meth:`_recompile`」，而 :meth:`_recompile` 在参数非法时只打一行控制台
+        就 return（切刀且 ``touch_z < depth`` ⇒ :func:`cut_z_for_depth` 抛
+        ValueError ⇒ 下压后 Z 为负）。于是**内存唯一源已经是新几何，
+        ``_job_lines`` / 预览 / run 门禁却停在旧几何**，按『开始执行』发出去的是
+        旧版面——而作业页看上去一切正常。实测::
+
+            spec   = 2 段（含新增的 (50,50)-(150,50)）
+            lines  = 10 行旧几何（只有 X0/X10，无 X150），run 仍 enabled、runnable=True
+            worker 实收 = 那 10 行旧版面
+
+        两条赋值必须**一起**回滚：只还原 spec 而留下 ``_job_from_layout=True``，
+        会让后续一次静默同步把用户自己的文件作业顶掉（R6 的来源门禁靠它）。
+        ``_job_lines``/``_job_compiled``/预览在失败路径上根本没被碰过，无需还原。
+
+        返回 True = 真的重编译出了新 lines。
+        """
+        prev_spec, prev_from_layout = self._job_spec, self._job_from_layout
+        self._job_spec = spec
+        self._job_from_layout = from_layout
+        if self._recompile():
+            return True
+        self._job_spec, self._job_from_layout = prev_spec, prev_from_layout
+        return False
 
     def _on_layout_job_sync(self, spec) -> None:
         """排版页**静默**同步作业预览（页切换等轻量动作，PRD §10.1-8）。
@@ -1617,8 +1643,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # :meth:`_spec_with_current_params` 对其余参数的做法一致），combo
         # 一律不碰。只有来源切换（送去作业 / 载入文件）才重置 placement 下拉。
         spec = replace(spec, placement=self._job_spec.placement)
-        self._job_spec = spec
-        self._recompile()
+        self._set_job_and_recompile(spec, from_layout=True)
 
     def _on_clear_job(self) -> None:
         self._job_from_layout = False   # 作业没了 ⇒ 无来源可言
@@ -1827,7 +1852,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 
-    def _recompile(self) -> None:
+    def _recompile(self) -> bool:
         """唯一重编译汇流：JobSpec(内存唯一源) → compile_job → lines/预览。
 
         触发集：设/清工件原点、feed/Z 速度/跳段、去重/顺序/笔径、材料/切深/
@@ -1835,12 +1860,17 @@ class MainWindow(QtWidgets.QMainWindow):
         导出。**执行中 no-op + 提示**，jobDone 后补编译（§2.2）。
         预览吃 compile 内 ``parse_lines(将发送的同一份 lines)`` 的 segments，
         worker 发同一份 lines —— 单一真源，无第二数据源。
+
+        返回**是否真的重编译出了新 lines**（R8）：执行中 no-op、无作业、参数
+        非法三条早退路径都返回 False，供 :meth:`_set_job_and_recompile` 决定
+        是否回滚刚赋的 spec。**触发集与成功路径语义一字未改**，只是多一个返回值
+        供调用方判断成败。
         """
         if self._job_running:
             self._append_console("执行中，参数改动本次作业结束后生效")
-            return
+            return False
         if self._job_spec is None:
-            return
+            return False
         try:
             # _spec_with_current_params 在 try 内：_current_zmap 的算术面
             # （cut_z_for_depth：touch_z < depth → 负 Z，§6 编译期拒绝）抛
@@ -1849,7 +1879,7 @@ class MainWindow(QtWidgets.QMainWindow):
             compiled = compile_job(spec, strict=False)
         except ValueError as exc:  # Z 断言/参数域错误：保持上一份 lines+预览
             self._append_console(f"编译失败（参数）：{exc}")
-            return
+            return False
         self._job_compiled = compiled
         self._job_spec = spec  # 参数投影同步回 spec（内存唯一源）
         self._job_lines = list(compiled.lines)
@@ -1858,6 +1888,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_gate_ui()  # 含 _update_run_btn + 对准/空跑按钮使能
         if compiled.bounds.violations:
             self._append_console("越界：" + "；".join(compiled.bounds.messages))
+        return True
 
     def _spec_with_current_params(self) -> JobSpec:
         """字段（= JobSpec 参数投影，presets 依赖这些属性名）→ 当前参数的 spec。"""

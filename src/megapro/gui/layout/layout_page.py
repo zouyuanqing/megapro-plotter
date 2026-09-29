@@ -1365,6 +1365,10 @@ class LayoutPage(QtWidgets.QWidget):
         items = [gi.model_item for gi in self._selected()]
         if items:
             self._undo.push(RemoveItemsCommand(self, items))
+        else:
+            # 第 8 个静默按钮（复核者在 R11 里白捡到的）：删除与层序/对齐/分布
+            # 同属工具条、同样在无选中时裸静默，同样既不禁用也无 tooltip。
+            self.status_message.emit("未选中图元：请先选中要删除的图元")
 
     def _copy_selected(self) -> None:
         """复制（FR-06 递归化）：按**操作单元**序列化，容器连子树一起带走。"""
@@ -1509,6 +1513,11 @@ class LayoutPage(QtWidgets.QWidget):
         """
         sel = self._selected()
         if not sel:
+            # 选择不足要出声（R11）：同文件 `group_selected`/`ungroup_selected`
+            # 在同样条件下都发中文提示，这里原先是裸 return —— 工具条上紧邻的
+            # 镜像按钮（C3 已修）出声、层序却零反馈。按钮既不禁用、也无 tooltip，
+            # 不存在「禁用即自证」这条路。
+            self.status_message.emit("未选中图元：请先选中要调整层序的图元")
             return
         # 基准：一次算好，循环内只推进游标（见 docstring 的 ⚠）
         if mode == "top":
@@ -1565,6 +1574,9 @@ class LayoutPage(QtWidgets.QWidget):
         """
         units = self._selected_units()
         if len(units) < 2:
+            # 同 :meth:`_zorder` 的理由（R11）：选择不足要出声，不裸 return。
+            self.status_message.emit(
+                f"对齐需至少选中 2 个操作单元，当前 {len(units)} 个")
             return
         boxes = [(u, self._unit_bbox(u)) for u, _ in units]
         xs0 = [b[0] for _, b in boxes]
@@ -1594,6 +1606,9 @@ class LayoutPage(QtWidgets.QWidget):
         """分布（FR-06 组语义）：组按容器 bbox 作为一个分布单元参与。"""
         units = self._selected_units()
         if len(units) < 3:
+            # 同 :meth:`_zorder` 的理由（R11）：选择不足要出声，不裸 return。
+            self.status_message.emit(
+                f"分布需至少选中 3 个操作单元，当前 {len(units)} 个")
             return
         boxes = [(u, self._unit_bbox(u)) for u, _ in units]
         changes = []

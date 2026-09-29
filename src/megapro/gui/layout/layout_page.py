@@ -1920,6 +1920,13 @@ class LayoutPage(QtWidgets.QWidget):
         ``flatten_visible``（z 升序拍平，跳 hidden/<2 点）+ ``Placement(mode=
         'preserve')`` —— 版面坐标即工件坐标，**排版直传不做 anchor 归位**
         （§2.2/§10 unclear #4）。纯数据拷贝，不消费/不清空源文档。
+
+        ⚠ **拍平的并列 z 由 ``(z, order)`` 决胜，``order`` 是入档序、不是列表
+        位置**（A4）。两者一致时 ``(z, order)`` 与基线 ``sorted(items, key=z)``
+        逐位相同；一旦某图元被 remove 后又 ``doc.add`` 重新入模，编号粘住不动
+        而列表位置变了 ⇒ 切割**次序**与那条基线分叉（几何多重集守恒，不少切、
+        不重切、不越床）。别把「与基线一致」当成全局不变量 —— 契约与反例见
+        tests/test_gui_layout_order_vs_baseline.py。
         """
         from megapro.gui.job import JobSpec, Placement
         from megapro.gui.layout.model import flatten_visible

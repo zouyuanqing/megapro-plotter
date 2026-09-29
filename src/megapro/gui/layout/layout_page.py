@@ -403,6 +403,20 @@ class LayoutPage(QtWidgets.QWidget):
 
         「点组内子项先选中整组」：对每个选中的图元取同容器的兄弟并全选。
         **组编辑态不做**（双击进组后操作单元 = 叶子，FR-05 选择态二分）。
+
+        ⚠ **补选兄弟时必须屏蔽 ``selectionChanged``**（R3）。逐个
+        ``gi.setSelected(want)`` 会让**每一次**改动都发一次场景信号 ⇒
+        递归回本方法、再走一遍 :meth:`_on_selection_changed` 的整条尾巴
+        （属性面板 + 手柄 + **组框判据**）。点一个 10 叶子组的成员，
+        ``_on_selection_changed`` 会被进入 10 次、``_complete_groups``
+        同样重算 10 次；而判据每次都要遍历相关子树的**全部折线点**
+        （``canvas/group_overlay.py`` 的 ``iter_leaves`` 算完变换即丢弃）。
+        实测 30 组×10 叶×800 点文档上一次点击手势 20 次调用、累计 1188 ms。
+
+        这里屏蔽后由**唯一调用方** :meth:`_on_selection_changed` 承担那一次刷新
+        —— 它在本方法返回之后才跑 ``_refresh_props`` / ``_handles.sync`` /
+        ``_group_overlay.refresh``，读到的正是补选后的最终选择集，语义与
+        逐个发信号时一致，只是把 N 次重算压成 1 次。
         """
         if self._group_overlay.editing is not None:
             return
@@ -416,10 +430,19 @@ class LayoutPage(QtWidgets.QWidget):
         if not wanted:
             return
         ids = {id(it) for it in wanted}
-        for gi in self._scene_items:
-            want = id(gi.model_item) in ids
-            if gi.isSelected() != want:
-                gi.setSelected(want)
+        pending = [gi for gi in self._scene_items
+                   if (id(gi.model_item) in ids) != gi.isSelected()]
+        if not pending:
+            return
+        # 一次手势 = 一次选择变更。``blockSignals`` 返回「此前是否已被屏蔽」，
+        # 照原样还回去 —— 无脑 blockSignals(False) 会把**外层**（若有人正在
+        # 批量改选择）设的屏蔽也一起撤掉，反而制造更难查的丢信号。
+        was_blocked = self.scene.blockSignals(True)
+        try:
+            for gi in pending:
+                gi.setSelected(True)
+        finally:
+            self.scene.blockSignals(was_blocked)
 
     def _enter_group_edit(self, item: Item) -> None:
         """双击组内子项 ⇒ 进组编辑态（FR-03「双击进组选子项」）。"""

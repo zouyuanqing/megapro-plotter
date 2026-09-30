@@ -1561,8 +1561,8 @@ class LayoutPage(QtWidgets.QWidget):
     # -- 层序 / 对齐 / 分布 -------------------------------------------------
 
     def _zorder(self, mode: str) -> None:
-        """层序（FR-06 组语义）：组按**整组**参与，组内叶子 z 同步更新且
-        **保持组内相对次序**，全部一条命令。
+        """层序（FR-06 组语义）：组按**整组**参与，组内叶子 z 同步更新，全部
+        一条命令。
 
         「up/down」按组内**最小** z 判档、整体平移同一增量（保持组内间距）；
         「top/bottom」把**全部选中叶子**压到全树最上/最下的一段**连续** z 区间。
@@ -1577,6 +1577,18 @@ class LayoutPage(QtWidgets.QWidget):
             拍平序  [X, M0, M2, M1]       ← 散件插进组中间，切割次序被打乱
             修复后  M0=51, M1=52, M2=53   ← 选中集 {51,52,53} 连续一段
 
+        **「保持选中前相对层序」在两个口径上都成立**（D4）—— 跨单元靠
+        ``units.sort(key=min(叶子 z))``，**组内**靠铺开前
+        ``sorted(leaves, key=z)``。两者都不能用**文档序**：``iter_leaves`` 给
+        的是 children 的文档序（入模顺序），它与 z 序（画上去的先后）可以相反。
+        曾经只按跨单元排序、组内仍按文档序铺开 ⇒ 整组 top/bottom **翻转组内
+        切割次序**（A-11 实测：X(z=3) 先画、Y(z=2) 后画，children 文档序
+        ``[X, Y]``，置顶后切割序从 ``[Y, X]`` 翻成 ``[X, Y]`` —— 先画的 X
+        被切到前面）。拍平走 ``key=z``，故 **z 序就是切割次序**，这是硬约束。
+
+        并列 z 时用稳定排序保留原顺序（不引入新的乱序）；z 相等的两项在拍平里
+        由 ``order`` 决胜，与本操作无关。
+
         拍平序 = 切割次序（:func:`flatten_visible` 走 ``key=z`` 稳定排序），所以
         这不是画布显示问题，是发往机器的 G-code 次序变了。
         """
@@ -1588,21 +1600,36 @@ class LayoutPage(QtWidgets.QWidget):
             # 不存在「禁用即自证」这条路。
             self.status_message.emit("未选中图元：请先选中要调整层序的图元")
             return
+        changes = []
+        units = self._selected_units()
         # 基准：一次算好，循环内只推进游标（见 docstring 的 ⚠）
         if mode == "top":
             cursor = self.doc.top_z() + 1
         elif mode == "bottom":
-            cursor = self.doc.bottom_z() - 1
+            # ⚠ **置底的起点要让整块落在最低处，且段内仍按 z 序递进**（D4-①）。
+            # 原实现给 ``bottom_z() - 1`` 起手、铺开时 ``cursor += 1`` **只增
+            # 不减** ⇒ 游标其实在往上爬，跨过 ``bottom_z`` 就撞进未选中项
+            # 占住的区间。A-4 原场景（X z=1 未选、M0 z=2、M1 z=3、Y z=4，
+            # 选 M0+M1 置底）实测得到
+            # ``z=[('M0',0.0),('M1',1.0),('X',1.0),('Y',4.0)]``
+            # —— M1 与未选中的 X **并列 1.0**，X 被切在两个选中件中间。
+            # 置顶安全（游标向上、必在全体之上），洞只在置底。
+            #
+            # 改法：起点 = ``bottom_z - 叶子数``（整块最低处），段内仍 **+1**
+            # 递增 ⇒ 块内 z = [bottom_z-n, ..., bottom_z-1]，max 严格小于
+            # ``bottom_z``，且**先到的单元仍拿最低 z**（相对层序不倒）。
+            # ⚠ 不能改成「起点 bottom_z-1 + 步长 -1」：那样块内 z 递减，
+            # 先到的单元反而拿最高 z ⇒ 把相对层序**倒过来**（另一个 bug）。
+            n_leaves = sum(len(self._leaves_of_unit(u)) for u, _ in units)
+            cursor = self.doc.bottom_z() - n_leaves
         else:
             cursor = None
-        changes = []
-        units = self._selected_units()
         if cursor is not None:
             # ⚠ **跨单元的相对次序必须由文档决定，不能由 Qt 决定**（R7）。
             # :meth:`_selected_units` 走 ``scene.selectedItems()``，返回顺序
             # **无保证**——同一场景跨进程实测 12 次出现 5 种次序；而 top/bottom
-            # 的游标是**按迭代顺序**分配的（``cursor += 1``），于是同一个操作在
-            # 两次启动里会发出**不同的切割次序**给机器::
+            # 的游标是**按迭代顺序**分配的（``cursor += 1``），于是同一个
+            # 操作在两次启动里会发出**不同的切割次序**给机器::
             #
             #   units=['G','M2'] ⇒ M0=51,M1=52,M2=53 ⇒ 切 ['X','M0','M1','M2']
             #   units=['M2','G'] ⇒ M0=52,M1=53,M2=51 ⇒ 切 ['X','M2','M0','M1']
@@ -1611,9 +1638,12 @@ class LayoutPage(QtWidgets.QWidget):
             # 断言抓不住它——被刻意放开的那个量恰好就是发往机器的切割次序。
             # 穿同一片叠料的两刀先后是可观测的切割结果。
             #
-            # 故按各单元的 **min(叶子 z) 稳定排序**后再铺开：top/bottom 都保持
-            # 选中前的相对层序（FR-06 的整组连续不受影响，只是不再被 Qt 的
-            # 返回序打乱）。稳定 ⇒ 并列 min z 时仍沿用原顺序，不引入新的乱序。
+            # 故按各单元的 **min(叶子 z) 稳定排序**后再铺开：保持选中前的**跨
+            # 单元**相对层序（FR-06 的整组连续不受影响，只是不再被 Qt 的返回序
+            # 打乱）。稳定 ⇒ 并列 min z 时仍沿用原顺序，不引入新的乱序。
+            #
+            # ⚠ 这条只管**跨单元**；**组内**另有一道 ``sorted(leaves, key=z)``
+            # （见下方 top/bottom 分支）—— 跨单元对了不等于组内也对（A-11）。
             units.sort(key=lambda uc: min(
                 (it.z for it in self._leaves_of_unit(uc[0])), default=0.0))
         for unit, _ in units:
@@ -1626,6 +1656,18 @@ class LayoutPage(QtWidgets.QWidget):
                 delta = 1.0 if mode == "up" else -1.0
                 new_zs = [z + delta for z in zs]
             else:                          # top / bottom：跨单元连续铺开
+                # ⚠ **组内也必须按 z 序铺，不能按 children 文档序**（D4-②）。
+                # ``iter_leaves`` 给的是**文档序**（入模/挂进容器的顺序），
+                # 它与 z 序（画上去的先后）**可以相反**：X(z=3) 先画但排在
+                # children 文档序前面，Y(z=2) 后画却排在后面 —— 按文档序分配
+                # 游标会让 X 拿到更小的 z、被切到 Y 前面，整组置顶/置底都把
+                # **组内**切割次序翻转（A-11 实测：['Y','X'] → ['X','Y']）。
+                # 拍平走 ``key=z``，所以 z 序**就是**切割次序。
+                #
+                # 并列 z 时用稳定排序保留原顺序（与上面跨单元同一条纪律：
+                # 不引入新的乱序）。z 相等时两者在拍平里由 ``order`` 决胜，
+                # 与本操作无关。
+                leaves = sorted(leaves, key=lambda it: it.z)
                 new_zs = []
                 for _ in leaves:
                     new_zs.append(cursor)

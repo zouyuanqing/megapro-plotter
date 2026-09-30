@@ -650,3 +650,112 @@ def test_r4_real_align_still_works_and_reports_success():
                     for leaf, chain in iter_ancestors(lp.doc.items)
                     if leaf.name in ("a", "b")))
     assert abs(xs[0] - xs[1]) < 1e-6, f"左对齐后两个图元的页面 min-x 应相等，实得 {xs}"
+
+
+# ============================================================================
+# R4/F3：空转判据从位级相等换成物理阈值（1e-9 mm）
+# ============================================================================
+
+def test_r4_align_float_tie_pushes_nothing_and_tells_truth():
+    """F3：浮点并列的「已居中」不得推恒等命令（位级相等判据的具体反例）。
+
+    A 跨页面 x[0.1,0.7]（同时持有 min-x 与 max-x）、C 跨 x[0.3,0.5]
+    （已精确居中）。hcenter target = (0.1+0.7)/2 = **0.39999999999999997**，
+    C 自身中心 = (0.3+0.5)/2 = 0.4 ⇒ dx = **-5.551115123125783e-17**。
+    错误实现（位级 ``it.pos != new_pos``）下失败值：推「对齐」命令 +
+    播报「已对齐 1 个图元」，C 的 pos 0.3 → 0.29999999999999993
+    （探针 .pytest_tmp/f3/probe_f3.py 实测）—— 物理零位移（机器步进
+    0.0125mm 的 10⁻¹⁵ 倍）被当成真移动，随后置顶的一次 Ctrl+Z 被它吃掉。
+    """
+    lp = _page(_rect("A", 0.0, 0.0, 0.6, 10.0, 1.0, pos=(0.1, 5.0)),
+               _rect("C", 0.0, 0.0, 0.2, 10.0, 2.0, pos=(0.3, 5.0)))
+    _select_all(lp)
+    from megapro.gui.layout.model import iter_leaves
+
+    before = {it.name: it.pos for it in iter_leaves(lp.doc.items)}
+    idx0 = lp._undo.index()
+
+    lp._align("hcenter")
+
+    after = {it.name: it.pos for it in iter_leaves(lp.doc.items)}
+    assert before == after, (
+        f"浮点并列不该动几何，实动 "
+        f"{ {k: (before[k], after[k]) for k in before if before[k] != after[k]} }")
+    assert lp._undo.index() == idx0, (
+        f"浮点并列仍推了恒等命令（index {idx0}->{lp._undo.index()}、"
+        f"undoText={lp._undo.undoText()!r}）—— 它会吃掉用户下一次 Ctrl+Z")
+    assert "已对齐" not in lp.status_label.text(), \
+        f"物理零位移被播报成成功：{lp.status_label.text()!r}"
+
+    # 后果链（ask：下一次 Ctrl+Z 直接撤掉前一个操作）：
+    lp._zorder("top")
+    z_top = _zmap(lp)
+    lp._align("hcenter")            # 浮点并列：不得推命令
+    lp._undo.undo()                 # 这一次必须撤掉置顶
+    assert _zmap(lp) != z_top, "一次 Ctrl+Z 没有撤掉置顶（被浮点并列命令吃掉）"
+
+
+def test_r4_distribute_float_tie_pushes_nothing():
+    """F3 的 ``_distribute`` 半边（要求 2：两处口径一致）。
+
+    三个零尺寸图元页面 y0 = 0.3/0.6/0.9（pos 非零 (7.0, y)）：gaps = 0.3、
+    target₁−0.6 = target₂−0.9 = **1.1102230246251565e-16**。错误实现下失败
+    值：推「分布」命令 + 播报「已分布 2 个图元」，d1/d2 的 pos 各漂
+    2.2e-16 mm（探针实测 (7.0,0.6)→(7.0,0.6000000000000002) 等）。
+    """
+    lp = _page(_rect("d0", 0.0, 0.0, 0.0, 0.0, 1.0, pos=(7.0, 0.3)),
+               _rect("d1", 0.0, 0.0, 0.0, 0.0, 2.0, pos=(7.0, 0.6)),
+               _rect("d2", 0.0, 0.0, 0.0, 0.0, 3.0, pos=(7.0, 0.9)))
+    _select_all(lp)
+    from megapro.gui.layout.model import iter_leaves
+
+    before = {it.name: it.pos for it in iter_leaves(lp.doc.items)}
+    idx0 = lp._undo.index()
+
+    lp._distribute("v")
+
+    after = {it.name: it.pos for it in iter_leaves(lp.doc.items)}
+    assert before == after, (
+        f"浮点并列不该动几何，实动 "
+        f"{ {k: (before[k], after[k]) for k in before if before[k] != after[k]} }")
+    assert lp._undo.index() == idx0, "浮点并列仍推了恒等「分布」命令"
+    assert "已分布" not in lp.status_label.text(), \
+        f"物理零位移被播报成成功：{lp.status_label.text()!r}"
+
+
+def test_r4_real_move_through_ancestor_still_pushes():
+    """F3 要求 3：阈值判据不误伤真移动 —— **非恒等祖先**（组平移 (100,30)、
+    叶子 pos 非零）下的真实对齐照常 push + 播报，且对齐到页面系同一左缘。
+
+    几何：la 页面 x0 = 100+12 = 112、lb 页面 x0 = 100+5 = 105 ⇒ 左对齐让
+    la 移动 dx=-7（远超 1e-9 阈值），lb 已在最左不动。错误实现（若阈值
+    误设过大）会把 -7 也吞掉 —— 本条钉「真移动照常 push」那半边。
+    """
+    lp = _page(_rect("la", 0.0, 0.0, 10.0, 20.0, 1.0, pos=(12.0, 34.0)),
+               _rect("lb", 0.0, 60.0, 10.0, 20.0, 2.0, pos=(5.0, 5.0)))
+    g = lp.doc.group_items([lp.doc.items[0], lp.doc.items[1]])
+    g.pos = (100.0, 30.0)
+    lp._rebuild_scene()
+    lp._after_change()
+    la, lb = lp.doc.items[0].children
+    lp._enter_group_edit(la)
+    for x in (lp._gi_for(la), lp._gi_for(lb)):
+        x.setSelected(True)
+    lp._on_selection_changed()
+    idx0 = lp._undo.index()
+
+    lp._align("left")
+
+    assert lp._undo.index() == idx0 + 1, "真移动（dx=-7）必须推命令"
+    assert "已对齐" in lp.status_label.text(), \
+        f"真移动应播报成功：{lp.status_label.text()!r}"
+    # 页面系左缘对齐（min 页面 x0 = 105）；la 父系 pos 12→5（纯平移祖先下
+    # 页面位移=父系位移）、lb 不动
+    assert abs(la.pos[0] - 5.0) < 1e-6 and abs(la.pos[1] - 34.0) < 1e-6, \
+        f"la 应移到父系 (5,34)，实得 {la.pos}"
+    assert abs(lb.pos[0] - 5.0) < 1e-6 and abs(lb.pos[1] - 5.0) < 1e-6, \
+        f"lb 已在最左不该动，实得 {lb.pos}"
+    la_x0 = unit_paths(la, (g,))[0][0][0]
+    lb_x0 = unit_paths(lb, (g,))[0][0][0]
+    assert abs(la_x0 - lb_x0) < 1e-6, \
+        f"左对齐后两叶页面 min-x 应相等，实得 {la_x0} vs {lb_x0}"

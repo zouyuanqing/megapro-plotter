@@ -1903,6 +1903,32 @@ class LayoutPage(QtWidgets.QWidget):
             # 成功也出声（B-17）：否则「无选中 ⇒ 请先选中」那一句会一直挂着。
             self._show_ok(f"已调整 {len(changes)} 个图元层序（{_ZORDER_CN[mode]}）")
 
+    # -- 对齐 / 分布（FR-06 组语义）-----------------------------------------
+
+    #: 「真动了」的物理阈值（mm，F3）：任一轴位移 ≥ 此值才算动、才进命令。
+    #: 机器步进分辨率 0.0125mm（X/Y 80 步/mm），1e-9 mm 是它的 8×10⁻⁸ 倍、
+    #: 远小于任何可见/可切的变化。位级相等（``it.pos != new_pos``）会把浮点
+    #: 并列的 5.55e-17 mm 位移当成「动了」——实测 ``(0.1+0.7)/2 -
+    #: (0.3+0.5)/2 = -5.551115123125783e-17``：已精确居中的图元被判不等 ⇒
+    #: 推恒等「对齐」命令并播报成功，随后置顶的一次 Ctrl+Z 被它吃掉（R4
+    #: 症状在浮点并列下原样复现，探针 .pytest_tmp/f3/probe_f3.py）。
+    #: ⚠ 故意放类体里、`:meth:`_align`` 之前（而不是模块顶部）：模块顶部
+    #: 的行数一变，AGENTS.md 里「Ctrl+A 全选仍是裸循环
+    #: （layout_page.py:1525）」的交叉引用就会指错行
+    #: （tests/test_gui_layout_feedback_and_docs.py 钉着它）。
+    _NO_MOVE_MM = 1e-9
+
+    @staticmethod
+    def _pos_moved(old: tuple[float, float], new: tuple[float, float]) -> bool:
+        """「真动了」判据：任一轴位移 ≥ :attr:`_NO_MOVE_MM`（1e-9 mm）。
+
+        :meth:`_align` / :meth:`_distribute` **共用同一份**（F3 要求 2：口径
+        一致，不许一处阈值一处位级）。真移动路径不受影响：机器可感/人眼可见
+        的位移远超 1e-9 mm。
+        """
+        return (abs(new[0] - old[0]) >= LayoutPage._NO_MOVE_MM
+                or abs(new[1] - old[1]) >= LayoutPage._NO_MOVE_MM)
+
     def _align(self, mode: str) -> None:
         """对齐（FR-06 组语义）：组按**容器 bbox** 参与，组内布局保持。
 
@@ -1933,22 +1959,27 @@ class LayoutPage(QtWidgets.QWidget):
             elif mode == "bottom":
                 dy = min(ys0) - y0
             for it in self._leaves_of_unit(unit):
-                # ⚠ **逐项过滤：新旧 pos 相同就不记**（对抗性复核 R4 实测）。
+                # ⚠ **逐项过滤：物理上没动就不记**（对抗性复核 R4 + F3）。
                 # 无条件 append ⇒ 「本来就对齐」时 changes 仍非空 ⇒ 推一条
                 # 恒等命令（undoText「对齐」、几何零变化），下一次 Ctrl+Z 被它
                 # 吃掉（实测：置顶 → 空转左对齐 → 一次 Ctrl+Z 后 z 纹丝不动、
-                # 需两次才撤掉置顶）。这与 :meth:`_mirror` / :meth:`_zorder`
-                # 各自的 `if ... != ...` 守卫是同一条纪律，缺它的是 _align。
+                # 需两次才撤掉置顶）。判据用 :func:`_pos_moved`（≥1e-9 mm）
+                # 而非位级 ``!=``：浮点并列（hcenter 的 target 除不尽）会给
+                # 已居中的图元算出 5.55e-17 mm 的假位移，位级相等照样判
+                # 「动了」—— R4 症状换一身衣服复现（F3 反例）。
                 new_pos = (it.pos[0] + dx, it.pos[1] + dy)
-                if it.pos != new_pos:
+                if self._pos_moved(it.pos, new_pos):
                     changes.append((it, {"pos": it.pos}, {"pos": new_pos}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "对齐"))
             # 成功也出声（B-17），否则更早那条「对齐需至少选中 2 个」会一直挂着。
             self._show_ok(f"已对齐 {len(changes)} 个图元（{_ALIGN_CN[mode]}）")
-        elif dx == 0.0 and dy == 0.0:
+        else:
             # 空转要说实话（B-18 家族：门槛已满足但没动）。**不能**报成功 ——
-            # 那会让页面最大的一行字与模型矛盾。
+            # 那会让页面最大的一行字与模型矛盾。走到这里 ⟺ 每个单元的位移都
+            # < 1e-9 mm（有真位移的单元必被上面逐项过滤记进 changes），故
+            # 「本来就对齐，未改动」是物理事实；判据**不能**再写
+            # ``dx == 0.0``——阈值化之后子阈值位移不是位级零。
             self._show_ok(f"这些图元本来就{_ALIGN_CN[mode]}，未改动")
 
     def _distribute(self, axis: str) -> None:
@@ -1969,10 +2000,12 @@ class LayoutPage(QtWidgets.QWidget):
             for i, (unit, (x0, y0, x1, y1)) in enumerate(boxes):
                 target = lo + i * gaps
                 for it in self._leaves_of_unit(unit):
-                    # 逐项过滤（对抗性复核 R4）：退化输入（如三个零宽图元
-                    # ⇒ gaps=0、target 全为 0）时不该推恒等命令。
+                    # 逐项过滤（对抗性复核 R4 + F3）：退化输入（如三个零宽图元
+                    # ⇒ gaps=0、target 全为 0）与浮点并列（target − y0 为
+                    # 1e-16 级假位移）都不该推恒等命令。判据与 _align 同一份
+                    # :func:`_pos_moved`（≥1e-9 mm），口径一致。
                     new_pos = (it.pos[0], it.pos[1] + target - y0)
-                    if it.pos != new_pos:
+                    if self._pos_moved(it.pos, new_pos):
                         changes.append((it, {"pos": it.pos}, {"pos": new_pos}))
         else:
             boxes.sort(key=lambda t: t[1][0])
@@ -1983,7 +2016,7 @@ class LayoutPage(QtWidgets.QWidget):
                 target = lo + i * gaps
                 for it in self._leaves_of_unit(unit):
                     new_pos = (it.pos[0] + target - x0, it.pos[1])
-                    if it.pos != new_pos:
+                    if self._pos_moved(it.pos, new_pos):
                         changes.append((it, {"pos": it.pos}, {"pos": new_pos}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "分布"))

@@ -84,6 +84,19 @@ DEFAULT_BAUD = 250000
 BAUD_CHOICES = ["250000", "115200"]
 
 
+#: :meth:`MainWindow._layout_out_of_bed_snapshot` 的三态哨兵：排版页
+#: **不存在/已析构**。「没有现值」有两种（F2 对抗复核）——排版页不在
+#: （回退缓存是对的）与排版页**存在且亲口回答床内**（``None``，现值为准、
+#: **不许**回退缓存）。旧实现两分支都返回 ``None``，告知侧的
+#: ``snapshot() or 缓存`` 于是把后者也送去回退：开关关掉后把图元拖回床内，
+#: 作业页仍报陈旧的 40.0mm（「陈旧值」的镜像方向）。哨兵**只允许**出现在
+#: 快照的即时消费点（:meth:`MainWindow._layout_bounds_notice`），入库缓存前
+#: 必须经 :meth:`MainWindow._layout_out_of_bed_cache` 归一成 ``None`` ——
+#: :attr:`MainWindow._layout_out_of_bed` 的类型契约是 ``tuple | None``
+#: （tests/test_gui_layout_job_sync_bounds.py 按属性真值断言）。
+_LAYOUT_PAGE_GONE = object()
+
+
 class _JobNotCalibrated(Exception):
     """作业需要但未标定（pen_down_z / cut_touch_z 缺失）。"""
 
@@ -1580,7 +1593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ``runnable=True violations=()``、job_info 无「排版版面越界」，
         # 机器切 (0,0)-(20,20) 而用户排的是 (-40,10) —— **零提示**。
         # 「送去作业」是同一条排版来源，判据该在**这一条路**上也取一次。
-        self._layout_out_of_bed = self._layout_out_of_bed_snapshot()
+        self._layout_out_of_bed = self._layout_out_of_bed_cache()
         self._set_job_and_recompile(spec, from_layout=True)
         self.tabs.setCurrentIndex(0)
         self._append_console("排版已送去作业页 —— 检查预览后点『开始执行』")
@@ -1720,25 +1733,41 @@ class MainWindow(QtWidgets.QMainWindow):
         # ``_set_job_and_recompile``：它会走 :meth:`_update_job_info`，
         # 而告知文案要读这个字段）。判据本身在排版页算好（几何真源在那儿），
         # 这里只取快照 —— 见 :attr:`_layout_out_of_bed`。
-        self._layout_out_of_bed = self._layout_out_of_bed_snapshot()
+        self._layout_out_of_bed = self._layout_out_of_bed_cache()
         self._set_job_and_recompile(spec, from_layout=True)
 
     def _layout_out_of_bed_snapshot(self):
-        """取排版页当前的越床判据（``_out_of_bed()`` 的值或 ``None``）。
+        """取排版页当前的越床判据，**三态**返回（F2）。
 
-        排版页可能已被销毁（析构期同步，见
-        :meth:`LayoutPage._on_undo_index_changed` 的存活守卫），故整段
-        ``getattr`` 兜住；取不到就当「没有越界信息」——**宁可少显示，
+        - ``(超出量 mm, 名单)``：排版页判越界；
+        - ``None``：排版页**存在**且亲口回答「床内」—— 现值就是它，消费方
+          **不许**拿它回退缓存；
+        - :data:`_LAYOUT_PAGE_GONE`：排版页不存在/已析构（析构期同步，见
+          :meth:`LayoutPage._on_undo_index_changed` 的存活守卫）—— 只有这一支
+          才允许消费方回退 :attr:`_layout_out_of_bed`。
+
+        整段 ``getattr`` 兜住存活问题；取不到就给哨兵 ——**宁可少显示，
         不可凭空报错**（这只是一段告知文案，不参与任何拦截）。
         """
         page = getattr(self, "layout_page", None)
         getter = getattr(page, "_out_of_bed", None)
         if getter is None:
-            return None
+            return _LAYOUT_PAGE_GONE
         try:
             return getter()
         except (RuntimeError, AttributeError):
-            return None
+            return _LAYOUT_PAGE_GONE
+
+    def _layout_out_of_bed_cache(self):
+        """:attr:`_layout_out_of_bed` 的**入库**版快照：哨兵归一成 ``None``。
+
+        缓存的类型契约是 ``tuple | None``（「判据值或没有」），哨兵只是快照
+        即时消费点（:meth:`_layout_bounds_notice`）里区分「页不在」与「页判
+        床内」的内部标记，绝不能存进属性 —— 否则 truthy 的哨兵会被
+        ``_layout_out_of_bed_shown`` 类的属性真值判据误读成「已告知越界」。
+        """
+        snap = self._layout_out_of_bed_snapshot()
+        return None if snap is _LAYOUT_PAGE_GONE else snap
 
     def _on_clear_job(self) -> None:
         self._job_from_layout = False   # 作业没了 ⇒ 无来源可言
@@ -2069,19 +2098,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         只在作业来源是排版时有意义（非排版作业没有「排版页判据」这回事）。
 
-        ⚠ **判据在这里现取，不读缓存**（对抗性复核 R2）。缓存
-        :attr:`_layout_out_of_bed` 只在「静默同步」这一条路上被赋值，而那条路
-        被「同步作业预览」复选框把守 ⇒ 用户一关该开关，整场会话判据停在
-        ``None``，作业页对「版面越界」**零提示**（机器切在 anchor 搬过的落点，
-        用户排版的原位置没人告诉他变了）。
-        更糟的变体：开关先开（判据取到 40.0mm）→ 关掉 → 再把图元拖到
-        -100mm ⇒ 作业页仍**自信地报 40.0mm**（少报 60mm），比不报更具误导性。
-        故每次要显示时**回头问排版页**（版面几何的真源在那儿），缓存只当
-        「没有排版页时的兜底」。
+        **「现值为准」的边界**（对抗性复核 R2 + F2）。缓存
+        :attr:`_layout_out_of_bed` 只在「静默同步/送去作业」那两条路上被赋值，
+        而前一条被「同步作业预览」复选框把守 ⇒ 用户一关该开关，缓存就冻结在
+        关开关那一刻，两个方向都会撒谎：
+
+        - **越报越大**（R2，已钉）：关掉后拖到更远处，作业页仍自信地报旧值
+          （40.0 vs 真实 100.0）；
+        - **该消失不消失**（F2，本轮）：关掉后把图元拖**回床内**，作业页仍报
+          「最大超出 40.0mm」，而排版页已经是干净的。
+
+        故每次要显示时**回头问排版页**（版面几何的真源在那儿）。但「没有现值」
+        有两种，不许混：快照的 ``None`` 若是**排版页存在且判床内**，现值为准、
+        不回退；只有快照给出 :data:`_LAYOUT_PAGE_GONE`（排版页不存在/已析构）
+        才回退缓存。旧实现 ``snapshot() or 缓存`` 把前一种 ``None`` 也当
+        「没有排版页」，正是 F2 反方向的根因。
         """
         over = None
         if self._job_from_layout:
-            over = self._layout_out_of_bed_snapshot() or self._layout_out_of_bed
+            snap = self._layout_out_of_bed_snapshot()
+            if snap is _LAYOUT_PAGE_GONE:
+                over = self._layout_out_of_bed  # 排版页不在 ⇒ 缓存兜底（唯一合法回退）
+            else:
+                over = snap                     # 排版页在 ⇒ 现值为准（None=床内也算数）
         if not over:
             return ""
         amount, names = over

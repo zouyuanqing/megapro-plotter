@@ -18,6 +18,10 @@
     那条路被「同步作业预览」复选框把守 ⇒ 用户**关掉**它（真控件、tooltip
     明写受支持）时整场会话停在 ``None`` ⇒ 作业页对「版面越界」零提示，
     而 anchor 已把落点搬走。修法：判据在**显示时现取**。
+    **F2 续**：现取实现写成 ``snapshot() or 缓存``，把「排版页**存在且判
+    None（床内）**」也当「没有排版页」回退缓存 ⇒ 反方向陈旧值（该消失
+    不消失）：关开关 → 拖回床内 → 作业页仍报 40.0mm。修法：快照三态
+    （越界元组 / ``None``=页在且床内 / 哨兵=页不在），只有哨兵才许回退。
 
 **R3**（``job_info`` 标签不换行，越界告知的可操作后半截被硬裁）
     D2-② 的告知只经这一个 QLabel 出去，1000px 窗口下整串需要 1188px、
@@ -401,6 +405,111 @@ def test_r2_export_path_also_populates_verdict(job_window):
     w._recompile()
     assert "排版版面越界" in w.job_info.text(), (
         f"export 路径没填判据：{w.job_info.text()!r}")
+
+
+# ============================================================================
+# R2/F2：越床判据「or 兜底」在反方向复活陈旧值（该消失不消失）
+# ============================================================================
+
+def test_r2_snapshot_distinguishes_missing_page_from_clean_page(job_window):
+    """两种「没有现值」必须可区分（F2 要求 1）：页在且床内 = ``None``（现值）、
+    页不在 = 哨兵（才许回退缓存）。
+
+    错误实现下：快照两分支都返回 ``None``，本用例第一断言（``is None`` 恒真
+    的话看不出）—— 判别力在第二断言：页不在时必须**不是** ``None`` 而是
+    哨兵；若有人把哨兵改回 ``None``（即恢复 or-兜底的前提），这里红。
+    """
+    from megapro.gui.main_window import _LAYOUT_PAGE_GONE
+
+    w = job_window
+    assert w.layout_page is not None, "前置：fixture 的排版页必须真实存在"
+    # 页在且床内（fixture 没放任何越界件）⇒ 快照必须是「现值 None」
+    assert w._layout_out_of_bed_snapshot() is None, \
+        "排版页存在且判床内 ⇒ 快照必须是 None（现值），不能是哨兵"
+    # 页不在 ⇒ 哨兵（唯一允许回退缓存的分支）
+    real = w.layout_page
+    try:
+        w.layout_page = None
+        assert w._layout_out_of_bed_snapshot() is _LAYOUT_PAGE_GONE, \
+            "排版页不存在 ⇒ 快照必须是哨兵（否则消费方无法区分两种 None）"
+    finally:
+        w.layout_page = real
+    # 入库版：哨兵必须归一成 None（缓存类型契约 tuple | None，哨兵 truthy
+    # 会被 test_gui_layout_job_sync_bounds 的属性真值判据误读成「已告知」）
+    w.layout_page = None
+    try:
+        assert w._layout_out_of_bed_cache() is None, \
+            "哨兵入库前必须归一成 None"
+    finally:
+        w.layout_page = real
+
+
+def test_r2_stale_warning_disappears_when_back_in_bed(job_window):
+    """F2 完整序列：送作业 → 拖出（cache=40）→ 关开关 → 拖回床内 → 重编译
+    ⇒ job_info **不得**再显示「⚠排版版面越界」。
+
+    错误实现下失败值：排版页 ``_out_of_bed()`` 已是 ``None``（页在、床内），
+    但 ``snapshot() or 缓存`` 把这个 None 当「没有排版页」回退陈旧缓存
+    (40.0, […]) ⇒ job_info 显示「最大超出 40.0mm」（探针实测，本批复现）。
+    """
+    w = job_window
+    lp = w.layout_page
+    assert lp is not None, "前置：排版页必须真实存在，不能 None"
+    lp._sync_job_cb.setChecked(True)   # fixture 交接时是关的；序列前半段靠静默同步填缓存
+
+    blk = _export_block(w)                                   # 床内 → 送去作业
+    assert w._layout_out_of_bed is None, \
+        f"前置：床内送去作业 ⇒ 缓存应为 None，实得 {w._layout_out_of_bed}"
+
+    _move_out_of_bed(lp, blk, (-40.0, 0.0))                  # 拖出（开关开 → 同步）
+    cached = w._layout_out_of_bed
+    assert cached is not None and abs(cached[0] - 40.0) < 1e-9, \
+        f"前置：静默同步应把缓存填成 40.0，实得 {cached}"
+
+    lp._sync_job_cb.setChecked(False)                        # 关开关
+    _move_out_of_bed(lp, blk, (0.0, 0.0))                    # 拖回床内（不发同步）
+    assert lp._out_of_bed() is None, "前置：排版页此刻应判床内"
+    assert w._layout_out_of_bed is not None, \
+        "前置：开关关 ⇒ 缓存无人清，仍握着陈旧 40.0（这正是要杀的场景）"
+
+    w._recompile()                                           # 作业页任意一次重编译
+    assert "⚠排版版面越界" not in w.job_info.text(), (
+        f"排版页已干净（_out_of_bed()=None），作业页仍报陈旧越界："
+        f"{w.job_info.text()!r} —— 快照 None 被 or 当「没有排版页」"
+        f"回退了缓存 {w._layout_out_of_bed}")
+
+
+def test_r2_growing_violation_shows_current_not_cached(job_window):
+    """镜像方向：开关关掉后越界**变大** ⇒ 必须显示现值（100.0），不许用旧缓存。
+
+    ⚠ 诚实标注：这条在**修复前也绿**——旧实现 ``snapshot() or 缓存`` 遇到
+    真值快照会短路、恰好选中现值；它钉的是反方向（防止有人把修法改成
+    「缓存优先/砍掉现取」时把已钉的 R2 方向修坏），不是 F2 的红绿判据。
+    F2 的红绿判据是上一条「该消失不消失」。
+    """
+    w = job_window
+    lp = w.layout_page
+    assert lp is not None, "前置：排版页必须真实存在，不能 None"
+    lp._sync_job_cb.setChecked(True)   # fixture 交接时是关的；前半段靠静默同步填缓存
+
+    blk = _export_block(w)
+    _move_out_of_bed(lp, blk, (-40.0, 0.0))                  # 开关开 → cache=40.0
+    cached = w._layout_out_of_bed
+    assert cached is not None and abs(cached[0] - 40.0) < 1e-9, \
+        f"前置：缓存应为 40.0，实得 {cached}"
+
+    lp._sync_job_cb.setChecked(False)                        # 关开关
+    _move_out_of_bed(lp, blk, (-100.0, 0.0))                 # 越界变大（不同步）
+    assert lp._out_of_bed() is not None and \
+        abs(lp._out_of_bed()[0] - 100.0) < 1e-9, \
+        f"前置：排版页现值应为 100.0，实得 {lp._out_of_bed()}"
+
+    w._recompile()
+    txt = w.job_info.text()
+    assert "100.0mm" in txt, \
+        f"越界变大后作业页必须报现值 100.0mm：{txt!r}"
+    assert "40.0mm" not in txt, \
+        f"作业页仍在用旧缓存 40.0mm（越报越小）：{txt!r}"
 
 
 # ============================================================================

@@ -154,6 +154,35 @@ class PathItem(QtWidgets.QGraphicsPathItem):
                 _affine_cache[chain] = self._affine
         self._refresh_ancestor_transform()
 
+    def page_origin(self) -> QtCore.QPointF:
+        """本地图元**本地原点**的页面（场景）坐标 = ``A(pos)``。
+
+        给需要**页面系**的消费者用（对比 :meth:`pos` 的**父系**语义）。
+        D1 之后两者可以差出一个完整的祖先变换：``pos()`` 是父坐标、
+        ``page_origin()`` 是 ``ancestor_affine`` 作用后的页面坐标。
+
+        **为什么必须有它**（对抗性复核 R1 实测）：``SelectionHandles.pivot()``
+        把支点与 ``scene_pos``（页面系）放在一起算 ``r0/r1`` 与旋转角，而它
+        取的是 ``gi.pos()``（父系）⇒ 在非恒等祖先下支点与手柄实际摆放位置
+        脱节：实测组 pos=(100,30) 时支点误差 **104.40mm**，抓可见角点拖到
+        两倍得 ``k=1.1497`` 而非 2.0。
+
+        ⚠ **消费方要自己在页面系里把结果换回父系再写 pos**（见
+        :meth:`page_to_parent`）—— ``pos()`` 的父系语义不能改：手柄
+        ``end()`` 与 :meth:`commit_move` 都把 ``gi.pos()`` 直接写回模型的
+        ``pos`` 字段，改了就把页面坐标写进父系字段。
+        """
+        return self.mapToParent(QtCore.QPointF(0.0, 0.0))
+
+    def page_to_parent(self, point: QtCore.QPointF) -> QtCore.QPointF:
+        """页面（场景）坐标 → 本图元的**父系** ``pos`` 值。
+
+        :meth:`page_origin` 的逆运算，给「在页面系里算完、要写回父系」的场景
+        用（手柄多选缩放/旋转就是：支点与鼠标都在页面系，算完必须换回来）。
+        空祖先链时恒等（顶层图元）。
+        """
+        return self.mapFromParent(point)
+
     def _refresh_ancestor_transform(self) -> None:
         """按**当前** ``pos`` 重算并写入祖先矩阵 ``M``。
 

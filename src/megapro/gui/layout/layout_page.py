@@ -1931,12 +1931,23 @@ class LayoutPage(QtWidgets.QWidget):
             elif mode == "bottom":
                 dy = min(ys0) - y0
             for it in self._leaves_of_unit(unit):
-                changes.append((it, {"pos": it.pos},
-                               {"pos": (it.pos[0] + dx, it.pos[1] + dy)}))
+                # ⚠ **逐项过滤：新旧 pos 相同就不记**（对抗性复核 R4 实测）。
+                # 无条件 append ⇒ 「本来就对齐」时 changes 仍非空 ⇒ 推一条
+                # 恒等命令（undoText「对齐」、几何零变化），下一次 Ctrl+Z 被它
+                # 吃掉（实测：置顶 → 空转左对齐 → 一次 Ctrl+Z 后 z 纹丝不动、
+                # 需两次才撤掉置顶）。这与 :meth:`_mirror` / :meth:`_zorder`
+                # 各自的 `if ... != ...` 守卫是同一条纪律，缺它的是 _align。
+                new_pos = (it.pos[0] + dx, it.pos[1] + dy)
+                if it.pos != new_pos:
+                    changes.append((it, {"pos": it.pos}, {"pos": new_pos}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "对齐"))
             # 成功也出声（B-17），否则更早那条「对齐需至少选中 2 个」会一直挂着。
             self._show_ok(f"已对齐 {len(changes)} 个图元（{_ALIGN_CN[mode]}）")
+        elif dx == 0.0 and dy == 0.0:
+            # 空转要说实话（B-18 家族：门槛已满足但没动）。**不能**报成功 ——
+            # 那会让页面最大的一行字与模型矛盾。
+            self._show_ok(f"这些图元本来就{_ALIGN_CN[mode]}，未改动")
 
     def _distribute(self, axis: str) -> None:
         """分布（FR-06 组语义）：组按容器 bbox 作为一个分布单元参与。"""
@@ -1956,8 +1967,11 @@ class LayoutPage(QtWidgets.QWidget):
             for i, (unit, (x0, y0, x1, y1)) in enumerate(boxes):
                 target = lo + i * gaps
                 for it in self._leaves_of_unit(unit):
-                    changes.append((it, {"pos": it.pos},
-                                   {"pos": (it.pos[0], it.pos[1] + target - y0)}))
+                    # 逐项过滤（对抗性复核 R4）：退化输入（如三个零宽图元
+                    # ⇒ gaps=0、target 全为 0）时不该推恒等命令。
+                    new_pos = (it.pos[0], it.pos[1] + target - y0)
+                    if it.pos != new_pos:
+                        changes.append((it, {"pos": it.pos}, {"pos": new_pos}))
         else:
             boxes.sort(key=lambda t: t[1][0])
             lo = boxes[0][1][0]
@@ -1966,13 +1980,18 @@ class LayoutPage(QtWidgets.QWidget):
             for i, (unit, (x0, y0, x1, y1)) in enumerate(boxes):
                 target = lo + i * gaps
                 for it in self._leaves_of_unit(unit):
-                    changes.append((it, {"pos": it.pos},
-                                   {"pos": (it.pos[0] + target - x0, it.pos[1])}))
+                    new_pos = (it.pos[0] + target - x0, it.pos[1])
+                    if it.pos != new_pos:
+                        changes.append((it, {"pos": it.pos}, {"pos": new_pos}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "分布"))
             # 成功也出声（B-17）。
             self._show_ok(
                 f"已分布 {len(changes)} 个图元（{'纵向' if axis == 'v' else '横向'}）")
+        else:
+            # 退化输入空转：说实话，不推命令也不报成功（同 _align 的处理）。
+            self._show_ok(
+                f"这些图元本来就均匀分布，未改动（{'纵向' if axis == 'v' else '横向'}）")
 
     # -- 添加 --------------------------------------------------------------
 

@@ -645,6 +645,14 @@ class MainWindow(QtWidgets.QMainWindow):
         info = QtWidgets.QHBoxLayout()
         self.job_info = QtWidgets.QLabel("未载入文件")
         self.job_info.setStyleSheet("color:#666")
+        # ⚠ **必须开 wordWrap**（对抗性复核 R3 实测）。D2-② 的告知串
+        # 「⚠排版版面越界N处(最大超出 Xmm)，落点已移到 bbox …，按当前放置执行」
+        # 只经这一个 QLabel 出去，而它默认不换行 ⇒ 窗口 1000px 时标签只分到
+        # 420px、整串需要 1188px，**99 字里只有前 35 字落像素**，被切掉的
+        # 恰好是「超出多少」与「已经挪到哪、照此执行」这两条**可操作事实**
+        # （悬停也无 tooltip，整串无处可看）。排版页的提示行本批已按 B-16 开了
+        # wordWrap，这里这条**兄弟标签**当时漏了。tooltip 再兜一层（换行前也能看全）。
+        self.job_info.setWordWrap(True)
         info.addWidget(self.job_info, 1)
         # 实机十字诚实化标注（阶段 4-③）：与 LiveMarker 同语义的常驻文字说明
         self.live_hint = QtWidgets.QLabel(
@@ -1563,6 +1571,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_console("排版导出参数无效（非 JobSpec），忽略")
             return
         self._set_placement_ui(spec.placement.mode)
+        # ⚠ 排版来源的越床判据**这里也必须填**（对抗性复核 R2 实测）。
+        # 原来只有 :meth:`_on_layout_job_sync` 填，而它被「同步作业预览」复选框
+        # 把守 —— 用户**关掉**该开关（真控件、tooltip 明写这是受支持的操作）时，
+        # 静默同步信号永不发 ⇒ :attr:`_layout_out_of_bed` 整场会话停在 ``None``
+        # ⇒ 作业页那句「排版版面越界…」**永不出现**。
+        # 实测：开关 OFF → 排版页 ``_out_of_bed()=(40.0, …)``，作业页
+        # ``runnable=True violations=()``、job_info 无「排版版面越界」，
+        # 机器切 (0,0)-(20,20) 而用户排的是 (-40,10) —— **零提示**。
+        # 「送去作业」是同一条排版来源，判据该在**这一条路**上也取一次。
+        self._layout_out_of_bed = self._layout_out_of_bed_snapshot()
         self._set_job_and_recompile(spec, from_layout=True)
         self.tabs.setCurrentIndex(0)
         self._append_console("排版已送去作业页 —— 检查预览后点『开始执行』")
@@ -2019,9 +2037,14 @@ class MainWindow(QtWidgets.QMainWindow):
         flags += self._layout_bounds_notice(bb, compiled, spec)
         if not compiled.meta.get("calibrated"):
             flags += "｜Z 未标定(禁执行)"
-        self.job_info.setText(
-            f"{spec.source_name or '未载入'}：{len(paths)} 段，"
-            f"{len(compiled.lines)} 行｜{mode}｜{bb_txt}{flags}")
+        text = (f"{spec.source_name or '未载入'}：{len(paths)} 段，"
+                f"{len(compiled.lines)} 行｜{mode}｜{bb_txt}{flags}")
+        self.job_info.setText(text)
+        # tooltip 兜底整串：wordWrap 解决「窗口够宽时看得全」，但窗口再窄
+        # 折行也可能在提示行数内放不下（对抗性复核 R3：1000px 时即便开了
+        # wordWrap，尾句仍可能被挤掉）。tooltip 让**任何**窗口宽度下都能
+        # 读到完整的「超出多少 / 挪到哪 / 照此执行」。
+        self.job_info.setToolTip(text)
 
     def _layout_bounds_notice(self, bb, compiled, spec) -> str:
         """**版面越界**时的告知文案（D2-②）；不越界返回空串。
@@ -2045,8 +2068,20 @@ class MainWindow(QtWidgets.QMainWindow):
         （``_update_run_btn`` / ``_on_run_job``）。
 
         只在作业来源是排版时有意义（非排版作业没有「排版页判据」这回事）。
+
+        ⚠ **判据在这里现取，不读缓存**（对抗性复核 R2）。缓存
+        :attr:`_layout_out_of_bed` 只在「静默同步」这一条路上被赋值，而那条路
+        被「同步作业预览」复选框把守 ⇒ 用户一关该开关，整场会话判据停在
+        ``None``，作业页对「版面越界」**零提示**（机器切在 anchor 搬过的落点，
+        用户排版的原位置没人告诉他变了）。
+        更糟的变体：开关先开（判据取到 40.0mm）→ 关掉 → 再把图元拖到
+        -100mm ⇒ 作业页仍**自信地报 40.0mm**（少报 60mm），比不报更具误导性。
+        故每次要显示时**回头问排版页**（版面几何的真源在那儿），缓存只当
+        「没有排版页时的兜底」。
         """
-        over = self._layout_out_of_bed if self._job_from_layout else None
+        over = None
+        if self._job_from_layout:
+            over = self._layout_out_of_bed_snapshot() or self._layout_out_of_bed
         if not over:
             return ""
         amount, names = over

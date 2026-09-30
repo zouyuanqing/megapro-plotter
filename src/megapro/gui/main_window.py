@@ -2119,13 +2119,36 @@ class MainWindow(QtWidgets.QMainWindow):
         """预览落笔路径（DRAW 段 2 点线）—— 与 ``parse_lines(_job_lines)`` 同源。"""
         return list(self._gcode_item.draw_lines) if self._gcode_item is not None else []
 
+    def _empty_job_reason(self) -> str | None:
+        """当前作业**没有任何几何**时的中文禁执行原因；不是空作业则 None。
+
+        「空作业」= 编译结果 ``meta["paths"]`` 为空。实测空作业
+        ``runnable=True``、``lines`` 有 4 行（G90/G21/G0/M400 等头尾指令），
+        于是按钮可点、点了把「一个什么都不切的作业」发给 worker，控制台还打
+        「开始执行（4 行）…」—— 用户以为机器动过了，其实一个落笔点都没有。
+        在切纸机上这是最不该发生的一类静默：空跑一趟、时间白花，而界面上
+        一切正常。
+
+        判据用**几何**而不是 ``lines`` 行数：``lines`` 非空只说明有 G90/G21
+        这类抬头，与「有没有要切的东西」无关。
+        """
+        compiled = self._job_compiled
+        if compiled is None:
+            return None
+        if compiled.meta.get("paths"):
+            return None
+        return "作业里没有图形：先在排版页画点东西，或载入一个 SVG 文件"
+
     def _update_run_btn(self) -> None:
         """执行按钮绑 CompiledJob.runnable **且** homed 门禁（阶段 4）。
 
         越界/未标定 → 禁执行（§3.1）；未连接/未归位 → 同样禁（can_start_job），
-        tooltip/状态栏给中文原因。
+        tooltip/状态栏给中文原因。**空作业**（0 条几何）也禁，理由见
+        :meth:`_empty_job_reason`（D5-④：修前它可点且点了静默空跑）。
         """
         reason = can_start_job(self._current_state(), self._homed)
+        if reason is None:
+            reason = self._empty_job_reason()
         ok = (not self._job_running and self._job_compiled is not None
               and self._job_compiled.runnable and bool(self._job_lines)
               and reason is None)
@@ -2145,6 +2168,15 @@ class MainWindow(QtWidgets.QMainWindow):
         compiled = self._job_compiled
         if compiled is None or not compiled.lines:
             self.status_label.setText("未载入作业")
+            return
+        # 空作业兜底（与 :meth:`_update_run_btn` 同判据）：按钮态可能陈旧
+        # （作业刚被换成空的、还没跑过 _refresh_gate_ui），而 ``runnable``
+        # 对空作业是 True ⇒ 光靠它拦不住。
+        empty = self._empty_job_reason()
+        if empty:
+            self.status_label.setText(empty)
+            self._append_console(f"禁执行：{empty}")
+            self._refresh_gate_ui()
             return
         if not compiled.runnable:  # 越界/未标定 → 禁执行（绑 runnable）
             msgs = compiled.bounds.messages or ["Z 未标定，禁执行"]

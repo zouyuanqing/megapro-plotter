@@ -85,6 +85,13 @@ TOOL_CIRCLE = "circle"
 TOOL_POLY = "poly"
 TOOL_PENCIL = "pencil"
 
+#: 层序操作名 → 中文（成功提示用；B-17 要求成功路径也出声）。
+_ZORDER_CN = {"top": "置顶", "bottom": "置底", "up": "上移一层", "down": "下移一层"}
+
+#: 对齐操作名 → 中文（成功提示用；B-17）。
+_ALIGN_CN = {"left": "左对齐", "right": "右对齐", "hcenter": "水平居中",
+             "top": "顶对齐", "bottom": "底对齐"}
+
 #: 越床容差（mm）：bbox 恰好贴住床沿不算越界（数值抖动不该弹框骚扰）。
 #: 与 ``main_window._travel_problem`` / Placement 判定的 1e-6 同量级。
 _BED_TOL_MM = 1e-6
@@ -301,6 +308,89 @@ def _restack_above(item: Item, top: float) -> float:
     return max(top, max(leaf.z for leaf in leaves))
 
 
+class _RemoveWithShellsCommand(QtGui.QUndoCommand):
+    """删除选中项 + 摘掉因此变空的**组外壳**，**一条命令**（D5-③ / Q3 修）。
+
+    为什么不用现成的 :class:`RemoveItemsCommand` 直接了事：它只删**成员**，
+    组容器会留在文档里变成空壳（``is_container()`` 变 False、``contains`` 仍为
+    True、``top_z()`` 还算它、而画布不渲染）。本命令把两半合成一步，于是
+    「删除」对用户仍是**一次 Ctrl+Z 就能完整回到原版面**。
+
+    **D5 第一版栽过的两个坑，这里都堵上了**（详见
+    :meth:`LayoutPage._delete_selected` 的 ①/②）：
+
+    ① 摘壳判据**不能**写成「``not it.children``」：普通顶层叶子的
+       ``children`` 也是 ``[]``，那样会把**未选中的散件**一起摘掉（实测三个
+       散件只删 L2 ⇒ 顶层变 ``[]``、一次撤销后只剩 ``['L2']``，L1/L3 永久
+       丢失）。故谓词收窄成「**删除前是容器**（由调用方快照给出）**且现在
+       变空了**」——删除后无法从文档反推容器身份。
+    ② 空壳的摘除**必须在撤销栈内**。放在栈外时撤销只还原成员、容器不回来
+       （实测撤销后顶层 ``[('b',0), ('a',0)]``，组静默解散）。故 undo 里
+       按记录的 ``(owner, index)`` 把壳挂回原位。
+
+    undo 的次序：**先复原成员、再挂回壳**。成员回插走
+    :meth:`RemoveItemsCommand._do_undo` 的**逆删除序**论证（``DetachInfo.index``
+    是「已删项塌陷之后」的下标，正序回插会得到原顺序的一个置换）；壳的
+    ``index`` 是在**成员已复原之后**记录的，与那时的列表一致，直接用即可。
+    """
+
+    def __init__(self, page, items, was_container, text="删除"):
+        super().__init__(text)
+        self.page = page
+        self.items = list(items)
+        self.was_container = set(was_container)
+        self._infos: list = []          # 成员的 DetachInfo（逆序回插用）
+        self._shells: list = []         # [(容器, owner, index)]
+
+    def redo(self) -> None:
+        # ⚠ **每次 redo 都重算**（与 :class:`RemoveItemsCommand` 同一形状），
+        # 不能加「只在第一次 redo 时跑」的 ``_first`` 短路：那样第二次 redo
+        # 会走进「复原」分支，把本该被删掉的组**放回来**（实测撤销后再重做，
+        # 顶层仍是 ``[('G', 2)]``，删除被撤销掉了）。
+        self._infos = []
+        for it in self.items:
+            self.page._remove_item_obj(it, info=self._infos)
+        self._shells = []
+        # ⚠ (owner, index) 必须**在摘下之前**记：``_remove_item_obj`` 已经把
+        # 壳从 ``doc.items`` 里摘走了，事后再 ``items.index(shell)`` 会
+        # ValueError（实测踩过）。故先量位置、再摘。
+        for shell in self.page._empty_container_candidates(self.was_container):
+            owner = self.page.doc.owner_of(shell)
+            index = (owner.children.index(shell) if owner is not None
+                     else self.page.doc.items.index(shell))
+            self.page._remove_item_obj(shell)
+            self._shells.append((shell, owner, index))
+        self.page._rebuild_scene()
+        self.page._after_change()
+
+    def _restore_members(self) -> None:
+        """成员回插 —— **逆删除序**（DetachInfo.index 的塌陷论证，见上）。"""
+        for it, info in zip(reversed(self.items), reversed(self._infos)):
+            if info is not None:
+                self.page.doc.attach(it, owner=info.owner, index=info.index)
+            else:
+                self.page.doc.add(it)
+            for leaf in iter_leaves([it]):
+                if self.page._gi_for(leaf) is None:
+                    make_gi(self.page, leaf)
+
+    def _restore_shells(self) -> None:
+        """把空壳挂回记录时的位置 ⇒ 组结构完整复原。"""
+        for shell, owner, index in self._shells:
+            if not self.page.doc.contains(shell):
+                self.page.doc.attach(shell, owner=owner, index=index)
+
+    def undo(self) -> None:
+        # ⚠ **壳必须先回**，成员才能挂回它里面：``owner_of`` 是在**当前文档**
+        # 里找持有者的，G 还没回到 ``doc.items`` 时 ``attach(a, owner=G)`` 会
+        # 落空、成员被挂成顶层散件（实测撤销后顶层 ``['G','KEEP','b','a']``，
+        # 且切割次序从 2 条变 4 条 ⇒ **同一几何切两遍**）。
+        self._restore_shells()
+        self._restore_members()
+        self.page._rebuild_scene()
+        self.page._after_change()
+
+
 class LayoutPage(QtWidgets.QWidget):
     """排版页：信号 export_requested(JobSpec) 供 MainWindow 送去作业。
 
@@ -339,6 +429,10 @@ class LayoutPage(QtWidgets.QWidget):
         # ``MoveItemsCommand`` 由 ``canvas/items.py`` 直接 push 到本栈。
         # 开关与门禁见 :meth:`_maybe_emit_job_sync`；_sync_models() 不 push
         # （纯 model→场景），故 :meth:`to_job_spec` 不会递归回来。
+        #: 压住静默同步的窗口（D5-③）：删除时要「push → 摘空壳 → 补发」三步
+        #: 一气呵成，中途那次同步会带一份**中间态**版面（成员已没、壳还在）。
+        #: 纯本页内部使用，不影响对外的信号契约。
+        self._sync_suppressed = False
         self._undo.indexChanged.connect(self._on_undo_index_changed)
         self._build_ui()
         self._refresh_page_bar()  # 建首个页签（默认单页）
@@ -758,12 +852,40 @@ class LayoutPage(QtWidgets.QWidget):
 
         本行是本页自己的落点，**常驻可见**；console 那条连接保留（作业页/复盘
         仍需要），但不再是唯一落点。文字样式沿用仓库其它 QLabel，不另造外观。
+
+        **必须开 ``wordWrap``**（B-16/D5-②）：不开的话 QLabel 的宽度由整条未折行
+        文本撑开，而布局只分给它剩下的宽度 ⇒ 长消息被**裁掉后半截**。被裁掉的
+        恰恰常是可操作那半句 —— 实测一条 59 字的中文拒收提示里，尾部
+        「已整单撤销粘贴，请确认剪贴板内容。」在 1000px 窗口下看不到。开了
+        wordWrap 后布局会按可用宽度折行，本行高度随内容变。
         """
         self.status_label = QtWidgets.QLabel("", self)
         self.status_label.setObjectName("layoutPageStatus")
+        # 长消息不许被裁（见 docstring）：默认 False ⇒ 裁切。
+        self.status_label.setWordWrap(True)
+        # 折行后高度要跟着变，否则折出来的第二行仍被固定高度切掉。
+        # ⚠ ``sizePolicy()`` 返回**副本**，必须 set 回去才生效。
+        pol = self.status_label.sizePolicy()
+        pol.setVerticalPolicy(QtWidgets.QSizePolicy.Policy.Minimum)
+        self.status_label.setSizePolicy(pol)
         self.status_label.setToolTip("本页最近一次操作提示（与作业页控制台同一来源）")
         self.status_message.connect(self._show_status)
         return self.status_label
+
+    def _show_ok(self, text: str) -> None:
+        """**成功**提示：只写页内提示行，**不**走 :attr:`status_message`。
+
+        为什么分两个通道（B-17/D5-①）：``status_message`` 的消费侧除了本页
+        提示行，还连着作业页 console（``main_window.py`` 的
+        ``status_message.connect(self._append_console)``）。而既有用例把
+        「操作不该在控制台留痕」钉成契约（``test_file_job_never_hijacked_by_
+        any_edit``：编辑不得为「顶掉别人作业」刷控制台）。
+
+        成功提示的**唯一用户**是排版页上的人（他要确认「刚才那下生效了」），
+        让它进作业页控制台只有噪音、没有信息。故：成功走本方法（页内一行），
+        拒绝仍走 ``status_message``（两处都出，保持 R11 的既有行为）。
+        """
+        self._show_status(text)
 
     def _show_status(self, text: str) -> None:
         """把 :attr:`status_message` 的文本写到页内提示行。
@@ -772,6 +894,9 @@ class LayoutPage(QtWidgets.QWidget):
         用户都错过它。下一条提示自然覆盖上一条。
         """
         self.status_label.setText(str(text))
+        # 折行数随文本长度变，提示行的**几何**要重算，否则布局仍按旧高度摆，
+        # 折出来的第二行会露在控件外面（看着像没换行）。
+        self.status_label.updateGeometry()
 
     def _build_page_bar(self) -> QtWidgets.QWidget:
         """页签条（FR-09）：页签 + 增/删/复制/左移/右移 + 作业预览同步开关。
@@ -858,6 +983,8 @@ class LayoutPage(QtWidgets.QWidget):
         :meth:`MainWindow._on_layout_job_sync` 既有实现承担，此处不重复也不
         绕过：非排版来源的作业在那边整段早退。
         """
+        if getattr(self, "_sync_suppressed", False):
+            return          # 事务中间态（D5-③），由调用方在收尾时补发
         cb = getattr(self, "_sync_job_cb", None)
         if cb is not None and not cb.isChecked():
             return
@@ -1431,13 +1558,98 @@ class LayoutPage(QtWidgets.QWidget):
             self._undo.push(MoveItemsCommand(self, moves, "微调"))
 
     def _delete_selected(self) -> None:
+        """删除选中图元；**连同被删空的组外壳**一起摘掉，且**同属一条撤销命令**。
+
+        ⚠ **为什么必须清空壳**（D5-③）：``RemoveItemsCommand`` 把组内成员逐个
+        摘走，而组容器本身还留在文档里 ⇒ 版面上挂着一个 ``paths=[]`` 且
+        ``children=[]`` 的空对象：``is_container()`` 变 False、``contains`` 仍为
+        True、``top_z()`` 还算它。它**不会被切**（拍平为空），但它是版面里的
+        一个幽灵：``Document.contains`` 说它在、``iter_items`` 枚举得到、而画布
+        不渲染、``sorted_items`` 的口径与它对不上。实测删光组内两个成员后顶层
+        仍剩 ``[('组', 0)]``。
+
+        选「删掉空容器」而不是「保留但不计 top_z」：空容器的**全部**可见性都在
+        「它为空」这一条上 —— 不渲染、不计界、不进拍平，保留它没有任何语义，
+        却让 ``contains`` / ``iter_items`` / 文档口径与实际版面分叉。
+
+        ⚠⚠ **本方法在 D5 第一版里写错过两次，都是静默数据丢失**（均已实测
+        复现并修好，勿再退回）：
+
+        ① **谓词写反**：曾用 ``[it for it in doc.items if not it.children]``
+        找「空壳」，而**普通顶层叶子的 ``children`` 本来就是 ``[]``** ⇒ 该谓词
+        命中的不只是空壳，还有**每一个未选中的散件**。实测三个散件 L1/L2/L3
+        只选 L2 删除 ⇒ 顶层变成 ``[]``、拍平 0 条，一次 Ctrl+Z 后只剩
+        ``['L2']``，L1/L3 **永久丢失**（摘壳在撤销栈之外）。
+        ⇒ 容器身份**不能从删除后的文档反推**（删除后无法区分「曾是容器的空壳」
+        与「一直是叶子的散件」），必须在删除**前**快照。
+
+        ② **摘壳不在撤销栈里**：曾把摘壳做成「push 之后单独做」，于是撤销一次
+        删除只把**成员**放回顶层、**组容器没了**（实测撤销后顶层
+        ``[('b',0), ('a',0)]`` —— 两个成员退化成两个散件，这个结构改变不可撤销）。
+        ⇒ 摘壳必须**进同一条命令**的 undo，由它一并还原。
+
+        故现在的做法：删除前 :meth:`_container_snapshot` 记下当前页所有容器
+        身份；删除后由 :class:`_RemoveWithShellsCommand` 把
+        「成员删除」与「空壳摘除」做成**一条**命令 —— undo 时先复原成员
+        （``RemoveItemsCommand`` 的逆序论证），再把空壳按记录的
+        (owner, index) 挂回原位，组结构因而完全可撤销（D5 第一版把摘壳放在
+        撤销栈之外，撤销后容器消失、成员退化成散件，见上面 ②）。
+        """
         items = [gi.model_item for gi in self._selected()]
-        if items:
-            self._undo.push(RemoveItemsCommand(self, items))
-        else:
+        if not items:
             # 第 8 个静默按钮（复核者在 R11 里白捡到的）：删除与层序/对齐/分布
             # 同属工具条、同样在无选中时裸静默，同样既不禁用也无 tooltip。
             self.status_message.emit("未选中图元：请先选中要删除的图元")
+            return
+        # ⚠ 必须在删除**前**快照：删除后无法从文档反推「谁曾是容器」
+        # （普通叶子的 children 也是 []，见上面 ①）。
+        was_container = self._container_snapshot()
+        # ⚠ **整段夹在一个事务里，中间必须压住同步**（D5 实测踩过）。
+        # 静默同步挂在 ``_undo.indexChanged`` 上，命令 redo 内部就会发一次 ——
+        # 那时成员已摘走、壳还在，作业页会收到一份 ``paths_paper`` **非空**
+        # 而当场版面已空的 spec（实测 ``[[(1,1),(2,2)]]`` vs
+        # ``flatten(doc)=[]``），据此显示「1 段」并可执行。压住后末尾补发一次。
+        self._sync_suppressed = True
+        try:
+            self._undo.push(_RemoveWithShellsCommand(
+                self, items, was_container))
+        finally:
+            self._sync_suppressed = False
+        # 补发：命令 redo 期间的那次同步被压掉了，所以这里**无条件**补一次，
+        # 让作业页看到**终态**版面。条件若写成「只有摘到壳才补」，普通删除
+        # （无组 ⇒ 无壳可摘）就会**一次都不发** ⇒ 作业页停在陈旧几何
+        # （实测「删除 未触发作业预览同步（陈旧几何）」红）。计数仍是
+        # 「一次编辑一次同步」。开关由 :meth:`_maybe_emit_job_sync` 自读。
+        self._maybe_emit_job_sync()
+
+    def _container_snapshot(self) -> set:
+        """当前页所有**容器**的身份集合（删除前快照）。
+
+        为什么要快照而不是事后用 ``not it.children`` 判：普通顶层叶子的
+        ``children`` 也是 ``[]``，事后判会把**未选中的散件**一起当成空壳摘掉
+        （D5 第一版的静默数据丢失，见 :meth:`_delete_selected` 的 ①）。
+        删除后文档里已经分不出「曾是容器的空壳」与「一直是叶子的散件」，
+        只能在删除**前**把容器身份记下来。
+        """
+        from megapro.gui.layout.model import iter_items
+
+        return {id(it) for it in iter_items(self.doc.items) if it.children}
+
+    def _empty_container_candidates(self, was_container: set) -> list:
+        """「删除前是容器、现在 ``children`` 为空」的当前页顶层项（**不摘**）。
+
+        判据**两个条件都要**：既在删除前的容器快照里、又已经空了。只判后者
+        会连**未选中的散件**一起摘（实测三个散件只删 L2 ⇒ 顶层变 ``[]``、
+        一次撤销后只剩 ``['L2']``，L1/L3 永久丢失）；只判前者会把非空的组也摘掉。
+
+        只看**当前页顶层**：组内出现空容器意味着「组里套着一个空组」，那是另一个
+        形状，本条不递归（递归会顺手删掉用户可能有意留的空组）。
+
+        只**返回**不摘 —— 调用方要**先量 (owner, index) 再摘**（摘完就找不到
+        ``index`` 了，实测会 ValueError）。
+        """
+        return [it for it in list(self.doc.items)
+                if id(it) in was_container and not it.children]
 
     def _copy_selected(self) -> None:
         """复制（FR-06 递归化）：按**操作单元**序列化，容器连子树一起带走。"""
@@ -1534,6 +1746,15 @@ class LayoutPage(QtWidgets.QWidget):
         if changes:
             self._undo.push(ChangeItemPropsCommand(
                 self, changes, "水平镜像" if axis == "h" else "垂直镜像"))
+            # **成功也必须出声**（B-17/D5-①）。此前只有「拒绝」这条路发提示，
+            # 于是「无选中 ⇒ 拒绝」之后的一次成功**不覆盖**它：状态行长期停在
+            # 「请先选中要镜像的图元」，而镜像其实已经做过了 —— 反馈通道自己
+            # 在说与模型相反的话。判据用 ``changes`` 非空（= 真的有东西被改），
+            # 「本来就那样、点了没动」的情况不发成功提示（那属于「门槛已满足
+            # 但空转」家族，由 _align 等各自的守卫负责）。
+            self._show_ok(
+                f"已{'镜像' if new else '取消镜像'} {len(changes)} 个图元"
+                f"（{'水平' if axis == 'h' else '垂直'}）")
         self._after_change()
 
     def _refresh_mirror_buttons(self) -> None:
@@ -1677,6 +1898,8 @@ class LayoutPage(QtWidgets.QWidget):
                     changes.append((it, {"z": it.z}, {"z": nz}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "层序"))
+            # 成功也出声（B-17）：否则「无选中 ⇒ 请先选中」那一句会一直挂着。
+            self._show_ok(f"已调整 {len(changes)} 个图元层序（{_ZORDER_CN[mode]}）")
 
     def _align(self, mode: str) -> None:
         """对齐（FR-06 组语义）：组按**容器 bbox** 参与，组内布局保持。
@@ -1712,6 +1935,8 @@ class LayoutPage(QtWidgets.QWidget):
                                {"pos": (it.pos[0] + dx, it.pos[1] + dy)}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "对齐"))
+            # 成功也出声（B-17），否则更早那条「对齐需至少选中 2 个」会一直挂着。
+            self._show_ok(f"已对齐 {len(changes)} 个图元（{_ALIGN_CN[mode]}）")
 
     def _distribute(self, axis: str) -> None:
         """分布（FR-06 组语义）：组按容器 bbox 作为一个分布单元参与。"""
@@ -1745,6 +1970,9 @@ class LayoutPage(QtWidgets.QWidget):
                                    {"pos": (it.pos[0] + target - x0, it.pos[1])}))
         if changes:
             self._undo.push(ChangeItemPropsCommand(self, changes, "分布"))
+            # 成功也出声（B-17）。
+            self._show_ok(
+                f"已分布 {len(changes)} 个图元（{'纵向' if axis == 'v' else '横向'}）")
 
     # -- 添加 --------------------------------------------------------------
 

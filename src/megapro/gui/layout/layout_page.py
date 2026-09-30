@@ -373,10 +373,22 @@ class LayoutPage(QtWidgets.QWidget):
         return det
 
     def _sync_gi(self, item: Item) -> None:
-        """model → 场景（场景 ≡ 纸面 y-up，**无翻转**）—— 场景同步唯一入口。"""
+        """model → 场景（场景 ≡ 纸面 y-up，**无翻转**）—— 场景同步唯一入口。
+
+        **祖先变换（D1）**：场景是扁平的（无 Qt 父子），而切割链
+        ``flatten_visible`` 会把整条祖先链逐层合成。故这里除自身变换外还要
+        把**祖先链**交给 :class:`PathItem`（``set_ancestor_chain``）——
+        否则「祖先带非恒等变换」时画布与机器切到两个位置（组容器被挪动、
+        粘贴造出的多层容器都会踩到）。
+
+        祖先链**必须从文档根查**（``iter_ancestors(self.doc.items)``），与
+        :meth:`_page_box` / :meth:`_owner_container` 同一口径 —— 从
+        ``[item]`` 起步只会遍历它自己的子树，拿不到容器上下文。
+        """
         gi = self._gi_for(item)
         if gi is None:
             return
+        gi.set_ancestor_chain(self._ancestor_chain(item))
         gi.apply_model_state()
         gi.setZValue(item.z)
         gi.setVisible(effectively_visible(self.doc, item))
@@ -384,8 +396,34 @@ class LayoutPage(QtWidgets.QWidget):
         gi.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, not item.locked)
         gi.update()
 
+    def _ancestor_chain(self, item: Item) -> tuple:
+        """``item`` 的祖先链（根在前、不含自身）；顶层图元返回空元组。
+
+        口径与 :meth:`_page_box` 完全一致（同一个 ``iter_ancestors`` 从
+        文档根起步、命中即停），不另发明一套遍历。
+        """
+        from megapro.gui.layout.model import iter_ancestors
+
+        for it, chain in iter_ancestors(self.doc.items):
+            if it is item:
+                return chain
+        return ()
+
     def _after_change(self) -> None:
-        """任何编辑后：刷新属性/手柄/组框。"""
+        """任何编辑后：刷新祖先变换（D1）、属性/手柄/组框。
+
+        **祖先变换必须在这里也刷一遍**：撤销命令（``GroupCommand`` /
+        ``UngroupCommand`` / ``AddItemsCommand`` …）各自只对**自己碰到**的
+        图元调 :meth:`_sync_gi`，而祖先链一变（编组/解组/粘贴/删组），
+        **整棵子树的叶子**都要跟着换矩阵。逐命令补齐那些调用点既漏又分散，
+        故在「任何编辑后」的公共汇流点统一兜一次。
+
+        代价：一次 ``iter_ancestors`` 全树走 + 每条**不同的**链算一次仿射
+        （同链叶子共用，见 :meth:`_sync_ancestor_chains`）。实测 1000 叶子
+        文档 2.0ms（祖先无镜像）/ 4.0ms（有镜像）—— 只在编辑后跑，不在
+        拖动逐帧上。
+        """
+        self._sync_ancestor_chains()
         self._refresh_props()
         self._handles.sync(self._selected())
         self._group_overlay.refresh(self._page_box)
@@ -910,7 +948,29 @@ class LayoutPage(QtWidgets.QWidget):
         self._scene_items.clear()
         for leaf in iter_leaves(self.doc.items):
             make_gi(self, leaf)
+        # **祖先链（D1）**：``make_gi`` 只建场景项、不施加祖先变换（它只调
+        # ``PathItem.__init__``，那时还没有链）。故建完统一补一遍。
+        self._sync_ancestor_chains()
         self._refresh_page_bar()
+
+    def _sync_ancestor_chains(self) -> None:
+        """把当前页**全部**可见场景项的祖先链刷新一遍（D1）。
+
+        与 :meth:`_sync_gi` 同一口径，但一次遍历解决全部图元 —— 祖先链对
+        同一条链上的所有叶子是**同一条**，逐叶重算 ``ancestor_affine`` 会把
+        成本乘以叶子数（而它对镜像祖先是 O(子树点数)）。故这里按**链身份**
+        记忆化：一条链只算一次仿射，链上的叶子共用。
+
+        页切换 / 场景全量重建（``_rebuild_scene``）与「任何编辑后」
+        （``_after_change``）走这里；单点同步走 :meth:`_sync_gi`。
+        """
+        from megapro.gui.layout.model import iter_ancestors
+
+        chains = {id(it): chain for it, chain in iter_ancestors(self.doc.items)}
+        affines: dict[tuple, tuple] = {}
+        for gi in list(self._scene_items):
+            gi.set_ancestor_chain(chains.get(id(gi.model_item), ()),
+                                  _affine_cache=affines)
 
     def _build_toolbar(self) -> QtWidgets.QWidget:
         """工具条：QToolBar（自带溢出「»」），避免按钮过多撑宽窗口。"""

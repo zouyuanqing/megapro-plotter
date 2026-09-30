@@ -13,6 +13,13 @@
     **已修**（handles + items 双侧）：单选支点走 ``page_origin()``、多选
     页面系结果经 ``page_to_parent``（真 A⁻¹，解析求逆）换回父系再写 pos。
     三个 fixture 的 pos 已改非零、祖先非恒等，round-trip 断言不再空洞。
+    **复验二续**：共形祖先（平移/旋转/缩放，det>0）逐位成立，但镜像祖先
+    （det<0）下自转增量 ``oa+delta`` 未按反射共轭换号（应 ``oa−delta``）⇒
+    形状相对刚性手势反向转 2δ（冻结仿射误差 91/247mm）。已修：按
+    ``det(A₀)`` 换号（handles._own_rotation_sign）；本节新增镜像祖先手势
+    回归。⚠ 仍开放（非实现错、model.py 所有权）：活镜像跨度
+    （``_mirror_span``=容器当前 bbox）随子项移动使**提交后**页面几何非
+    刚性，待另行裁决是否冻结跨度语义。
 
 **R2**（``_layout_out_of_bed`` 只在静默同步那条路上被填）
     那条路被「同步作业预览」复选框把守 ⇒ 用户**关掉**它（真控件、tooltip
@@ -334,6 +341,153 @@ def test_r1_page_to_parent_round_trip_six_ancestor_kinds(label):
         q = QtCore.QPointF(37.5, -21.25)
         assert gi.page_to_parent(q) == q, \
             f"空链应恒等，实得 {gi.page_to_parent(q)}"
+
+
+# ============================================================================
+# R1 残留（复验二）：镜像祖先（det<0）下旋转手势的自转增量换号
+# ============================================================================
+
+def _aff_apply(aff, p):
+    (a0x, a0y), ((a00, a10), (a01, a11)) = aff
+    return (a0x + a00 * p[0] + a01 * p[1], a0y + a10 * p[0] + a11 * p[1])
+
+
+def _aff_inv(aff, p):
+    (a0x, a0y), ((a00, a10), (a01, a11)) = aff
+    det = a00 * a11 - a01 * a10
+    dx, dy = p[0] - a0x, p[1] - a0y
+    return ((a11 * dx - a01 * dy) / det, (a00 * dy - a10 * dx) / det)
+
+
+def _mirror_group_page(mirror: bool):
+    """复验反例同构 fixture：容器 pos=(100,30) angle=33 scale=1.7（mirror_x
+    可关 ⇒ det(A₀)=−2.89 / +2.89），叶子 pos 非零、自带 scale/angle。
+    已进组编辑态、未选中的对象不做任何额外处理。"""
+    lp = _page(_rect("leaf", 0.0, 0.0, 10.0, 20.0, 1.0, pos=(12.0, 34.0),
+                     scale=1.2, angle_deg=17.0),
+               _rect("sib", 0.0, 60.0, 10.0, 20.0, 2.0, pos=(5.0, 5.0),
+                     scale=0.9, angle_deg=-8.0))
+    g = lp.doc.group_items([lp.doc.items[0], lp.doc.items[1]])
+    g.pos = (100.0, 30.0)
+    g.angle_deg = 33.0
+    g.scale = 1.7
+    if mirror:
+        g.mirror_x = True
+    lp._rebuild_scene()
+    lp._after_change()
+    leaf, sib = lp.doc.items[0].children
+    lp._enter_group_edit(leaf)
+    return lp, g, leaf, sib
+
+
+def _drag_rotate_90(lp) -> QtCore.QPointF:
+    """真手势（begin/update_drag/end）把选择集绕支点转 +90°（轴对齐起止点
+    ⇒ delta 恰 90.0）；返回 begin 时存的支点（页面系）。"""
+    h = lp._handles
+    rot_h = next(x for x in h._handles if x.kind == "rotate")
+    pv0 = h.pivot()
+    h.begin(rot_h, QtCore.QPointF(pv0.x() + 50.0, pv0.y()))
+    pivot = h._drag["pivot"]
+    h.update_drag(rot_h, QtCore.QPointF(pivot.x(), pivot.y() + 50.0))
+    h.end(rot_h, QtCore.QPointF(pivot.x(), pivot.y() + 50.0))
+    return pivot
+
+
+def test_r1_mirror_ancestor_rotate_sign_multi():
+    """镜像祖先（det(A₀)=−2.89）多选旋转 +90°：自转增量必须按反射共轭换号。
+
+    反射共轭：``aL⁻¹·R(δ)·aL = R(−δ)``（det<0）⇒ 自身角度应 ``oa−δ``。
+    错误实现（F1 的 ``oa+delta``，对共形祖先逐位正确）失败值：17→**107**
+    （应 −73）、−8→**82**（应 −98），冻结仿射误差 91.2/246.7mm
+    （探针 .pytest_tmp/r1r/probe_r1r.py 实测，det=−1 同样归零）。
+    pos 写回（A₀⁻¹ 刚性理想，裸数学独立计算）修复前后都对，一并钉住防
+    换号时动到写回。⚠ 本测试**不**钉（复验口径，model.py 所有权）：活镜像
+    跨度（``_mirror_span``=容器当前 bbox）随子项移动使提交后页面几何非刚性。
+    """
+    import math
+
+    from megapro.gui.canvas.items import ancestor_affine
+
+    lp, g, leaf, sib = _mirror_group_page(mirror=True)
+    gis = [lp._gi_for(leaf), lp._gi_for(sib)]
+    for x in gis:
+        x.setSelected(True)
+    lp._on_selection_changed()
+
+    A0 = {id(t): ancestor_affine((g,)) for t in (leaf, sib)}
+    begin = {id(t): (t.pos, t.angle_deg) for t in (leaf, sib)}
+    idx0 = lp._undo.index()
+
+    pivot = _drag_rotate_90(lp)
+    pv = (pivot.x(), pivot.y())
+    rad = math.radians(90.0)
+    c, s = math.cos(rad), math.sin(rad)
+
+    assert lp._undo.index() == idx0 + 1, "手势必须推一条命令"
+    for t in (leaf, sib):
+        op, oa = begin[id(t)]
+        # ① 自转角：det<0 ⇒ oa−δ。错误实现给 oa+90（17→107 / −8→82）。
+        assert abs(t.angle_deg - (oa - 90.0)) < 1e-9, (
+            f"{t.name}: angle {oa}→{t.angle_deg} 应为 {oa - 90:.0f}"
+            f"（反射共轭换号），错误实现给 {oa + 90:.0f}")
+        # ② pos 写回仍是 A₀⁻¹ 刚性理想（换号不许动到 F1 的写回数学）
+        opage = _aff_apply(A0[id(t)], op)
+        want_page = (pv[0] + c * (opage[0] - pv[0]) - s * (opage[1] - pv[1]),
+                     pv[1] + s * (opage[0] - pv[0]) + c * (opage[1] - pv[1]))
+        want = _aff_inv(A0[id(t)], want_page)
+        assert abs(t.pos[0] - want[0]) < 1e-6 and abs(t.pos[1] - want[1]) < 1e-6, \
+            f"{t.name}: pos {t.pos} 应为冻结仿射刚性理想 {want}"
+
+
+def test_r1_mirror_ancestor_rotate_sign_single():
+    """单选同病（同一分支）：镜像祖先下拖 +90° 自身角度必须 17→**−73**
+    （错误实现给 107）；单选旋转不写 pos（支点=画出来的原点），一并钉住。"""
+    lp, _g, leaf, _sib = _mirror_group_page(mirror=True)
+    gi = lp._gi_for(leaf)
+    gi.setSelected(True)
+    lp._on_selection_changed()
+
+    _drag_rotate_90(lp)
+
+    assert abs(leaf.angle_deg - (-73.0)) < 1e-9, \
+        f"angle 17→{leaf.angle_deg} 应为 −73（反射共轭换号；错误实现给 107）"
+    assert leaf.pos == (12.0, 34.0), f"单选旋转不该动 pos，实得 {leaf.pos}"
+
+
+def test_r1_conformal_ancestor_rotate_keeps_plus_delta():
+    """防「无条件换号」过修：同一 fixture 去掉 mirror_x（det(A₀)=+2.89）下
+    +90° 手势后角度必须 ``oa+90``（17→107、−8→82），且冻结仿射页面几何
+    **逐位**等于刚性旋转（共形祖先 bbox 不随子项动 ⇒ 无 A-move，探针实测
+    0.0000mm）。错误实现（不判 det 一律 −delta）失败值：17→−73。"""
+    import math
+
+    lp, g, leaf, sib = _mirror_group_page(mirror=False)
+    gis = [lp._gi_for(leaf), lp._gi_for(sib)]
+    for x in gis:
+        x.setSelected(True)
+    lp._on_selection_changed()
+
+    begin_pts = {id(t): [p for poly in unit_paths(t, (g,)) for p in poly]
+                 for t in (leaf, sib)}
+
+    pivot = _drag_rotate_90(lp)
+    pv = (pivot.x(), pivot.y())
+    rad = math.radians(90.0)
+    c, s = math.cos(rad), math.sin(rad)
+
+    assert abs(leaf.angle_deg - 107.0) < 1e-9, \
+        f"共形祖先 angle 17→{leaf.angle_deg} 应为 107（+delta，不许无条件换号）"
+    assert abs(sib.angle_deg - 82.0) < 1e-9, \
+        f"共形祖先 angle −8→{sib.angle_deg} 应为 82（+delta）"
+    for t in (leaf, sib):
+        got = [p for poly in unit_paths(t, (g,)) for p in poly]
+        want = [(pv[0] + (p[0] - pv[0]) * c - (p[1] - pv[1]) * s,
+                 pv[1] + (p[0] - pv[0]) * s + (p[1] - pv[1]) * c)
+                for p in begin_pts[id(t)]]
+        dev = max(math.hypot(f[0] - w[0], f[1] - w[1])
+                  for f, w in zip(got, want))
+        assert dev < 1e-6, \
+            f"{t.name}: 共形祖先下提交几何应 ≡ 刚性旋转 +90°，偏差 {dev:.6f}mm"
 
 
 # ============================================================================

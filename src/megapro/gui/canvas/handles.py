@@ -205,6 +205,27 @@ class SelectionHandles:
                     for gi in self._targets],
         }
 
+    @staticmethod
+    def _own_rotation_sign(gi) -> float:
+        """反射共轭换号（复验 R1 残留，F1 修复未覆盖的边界）。
+
+        页面系刚性旋转 δ 要落到「祖先线性 aL ∘ 自身旋转 R(θ)」的合成上，须
+        共轭：``aL⁻¹·R(δ)·aL`` = R(+δ)（det(aL)>0，共形：平移/旋转/缩放及
+        mirror_x+mirror_y=−I 组合）/ R(−δ)（det(aL)<0，含单镜像）。故叶子
+        **自身角度**增量必须按祖先仿射行列式换号，否则镜像祖先下形状相对
+        刚性手势反向转 2δ（实测冻结仿射误差 91/247mm，−delta 精确归零，
+        det=−1 与 −2.89 两种都验；共形祖先 +delta 本就 0.0000mm，换号会引入
+        同量误差 —— 符号条件恰为 det<0）。``pos`` 写回（A⁻¹，F1）对任意可逆
+        A 都对，只有自转角要换号。``_affine`` 缺失（非 PathItem 目标）时退回
+        +1（旧行为）。
+        """
+        affine = getattr(gi, "_affine", None)
+        if affine is None:
+            return 1.0
+        (_a0x, _a0y), ((a00, a10), (a01, a11)) = affine
+        det = a00 * a11 - a01 * a10
+        return 1.0 if det > 0 else -1.0
+
     def update_drag(self, handle: _HandleItem, scene_pos: QtCore.QPointF) -> None:
         d = self._drag
         if not d:
@@ -216,7 +237,8 @@ class SelectionHandles:
             delta = math.degrees(a1 - a0)
             for gi, (_op, _os, oa, _osp, _osc, _orot, opage) in zip(
                     self._targets, d["old"]):
-                gi.setRotation(oa + delta)
+                # 自转增量按祖先仿射行列式换号（见 :meth:`_own_rotation_sign`）
+                gi.setRotation(oa + self._own_rotation_sign(gi) * delta)
                 if len(self._targets) > 1:
                     # 支点/手势/初始原点都在**页面系**；``pos`` 是父系字段，
                     # 写回前必须经 ``page_to_parent``（= A⁻¹）换系 —— 直接把

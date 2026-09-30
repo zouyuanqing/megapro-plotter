@@ -131,6 +131,14 @@ class MainWindow(QtWidgets.QMainWindow):
         #: 「排版版面」**的文件会与排版作业撞名，静默同步随即把它接管。布尔
         #: 门禁在构造上就没有这个洞。
         self._job_from_layout = False
+        #: **排版面版的越床判据**（D2-②）：``LayoutPage._out_of_bed()`` 的
+        #: 快照，由 :meth:`_on_layout_job_sync` 在每次静默同步时向排版页取。
+        #: 形状与其返回值相同（``(最大超出 mm, 清单)`` / ``None``）——**不在
+        #: 作业页重算**：版面几何的真源在排版页，而作业页自己那套
+        #: （``compiled.bounds``）判的是放置**之后**的几何，anchor 归位会把
+        #: 越界件拉回床内使它为空。此字段**只用于显示告知**，
+        #: 绝不参与拦截（拦截仍由 ``compiled.runnable`` 负责）。
+        self._layout_out_of_bed = None
         self._job_running = False
         self._running_compiled = None  # 执行开始时的不可变快照（进度高亮/发送同源）
         self._feed_xy = 1200.0  # 作业 XY 进给率 mm/min
@@ -1509,6 +1517,7 @@ class MainWindow(QtWidgets.QMainWindow):
         placement = self._placement_for_meta(meta)
         self._set_placement_ui(placement.mode)
         # 用户自己的文件作业 —— 不是排版的（from_layout=False）
+        self._layout_out_of_bed = None  # 文件作业不继承排版页的越界判据（D2-②）
         self._set_job_and_recompile(JobSpec(
             paths_paper=paper_from_svg_ydown(paths_svg),
             source_name=Path(path).name,
@@ -1643,10 +1652,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # :meth:`_spec_with_current_params` 对其余参数的做法一致），combo
         # 一律不碰。只有来源切换（送去作业 / 载入文件）才重置 placement 下拉。
         spec = replace(spec, placement=self._job_spec.placement)
+        # **D2-②：先记下排版页的越床判据，再编译**（必须早于
+        # ``_set_job_and_recompile``：它会走 :meth:`_update_job_info`，
+        # 而告知文案要读这个字段）。判据本身在排版页算好（几何真源在那儿），
+        # 这里只取快照 —— 见 :attr:`_layout_out_of_bed`。
+        self._layout_out_of_bed = self._layout_out_of_bed_snapshot()
         self._set_job_and_recompile(spec, from_layout=True)
+
+    def _layout_out_of_bed_snapshot(self):
+        """取排版页当前的越床判据（``_out_of_bed()`` 的值或 ``None``）。
+
+        排版页可能已被销毁（析构期同步，见
+        :meth:`LayoutPage._on_undo_index_changed` 的存活守卫），故整段
+        ``getattr`` 兜住；取不到就当「没有越界信息」——**宁可少显示，
+        不可凭空报错**（这只是一段告知文案，不参与任何拦截）。
+        """
+        page = getattr(self, "layout_page", None)
+        getter = getattr(page, "_out_of_bed", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except (RuntimeError, AttributeError):
+            return None
 
     def _on_clear_job(self) -> None:
         self._job_from_layout = False   # 作业没了 ⇒ 无来源可言
+        self._layout_out_of_bed = None  # 同理：排版越界判据不再适用（D2-②）
         self._job_spec = None
         self._job_lines = []
         self._job_compiled = None
@@ -1929,11 +1961,59 @@ class MainWindow(QtWidgets.QMainWindow):
         flags = ""
         if compiled.bounds.violations:
             flags += f"｜越界{len(compiled.bounds.violations)}处(禁执行)"
+        flags += self._layout_bounds_notice(bb, compiled, spec)
         if not compiled.meta.get("calibrated"):
             flags += "｜Z 未标定(禁执行)"
         self.job_info.setText(
             f"{spec.source_name or '未载入'}：{len(paths)} 段，"
             f"{len(compiled.lines)} 行｜{mode}｜{bb_txt}{flags}")
+
+    def _layout_bounds_notice(self, bb, compiled, spec) -> str:
+        """**版面越界**时的告知文案（D2-②）；不越界返回空串。
+
+        缺口：``compiled.bounds`` 判的是**放置之后**的几何（这是对的 ——
+        机器切的就是那个）。于是两种情形作业页都会显得「干净」：
+
+        ① anchor 把越界件整体拉回床内 ⇒ ``violations`` 为空、``runnable=True``，
+           而**用户排版时看到的东西越界、机器实际切的位置已经变了**；
+        ② preserve 原样保留越界件 ⇒ ``violations`` 非空，但那一行只说
+           「越界1处(禁执行)」，**没说这份版面本身就排在床外**。
+
+        **「有没有做归位」按 ``spec.placement.mode`` 判，不按 violations 判**
+        （Q3）：``place_at_anchor``（coords.py:145）只要 mode==anchor 就
+        **无条件**平移，哪怕平移后仍超床。故「归位做了但落点仍超床」必须
+        说「已移到 …但落点仍超床」，说成「未做放置归位」是不实陈述。
+
+        **为什么只告知不拦截**：落点**合法**时禁执行等于砸掉「锚点归位把
+        大版面挪进床内」这个正当功能（用户主动要的）。落点**也**越界时
+        ``compiled.bounds.violations`` → ``runnable=False`` 本来就挡住了
+        （``_update_run_btn`` / ``_on_run_job``）。
+
+        只在作业来源是排版时有意义（非排版作业没有「排版页判据」这回事）。
+        """
+        over = self._layout_out_of_bed if self._job_from_layout else None
+        if not over:
+            return ""
+        amount, names = over
+        head = f"｜⚠排版版面越界{len(names)}处(最大超出 {amount:.1f}mm)"
+        # ⚠ **判据是「有没有做放置归位」，不是「落点还越不越界」**（Q3）。
+        # ``place_at_anchor``（coords.py:145）只要 mode==anchor 就**无条件**
+        # 平移，哪怕平移后仍然超床（300mm 宽的方块挪到 (0,0) 后右边缘仍在
+        # 250mm > 210mm；笔径把落点撑出床同理）。此时 ``violations`` 非空，
+        # 但几何**确实被搬了** ⇒ 说「未做放置归位」是不实陈述：画布
+        # (-50,0)-(250,20) 与机器 (0,0)-(300,20) 差 50mm，而界面否认发生过
+        # 任何移动。正确判据 = ``spec.placement.mode``（用户选了什么就说什么）。
+        if spec.placement.mode == "preserve":
+            # 原样保留：只补「版面本身就排在床外」这层事实（禁执行已由上面那截负责）
+            return head + "，未做放置归位"
+        if bb:
+            # 做了归位但落点**仍**超床 ⇒ 必须同时说清「搬了」和「仍越界」
+            # （禁执行那截已说越界，这里不重复，只给落点）。
+            tail = ("，但落点仍超床(禁执行)" if compiled.bounds.violations
+                    else "，按当前放置执行")
+            return (head + f"，落点已移到 bbox ({bb[0]:.0f},{bb[1]:.0f})"
+                          f"-({bb[2]:.0f},{bb[3]:.0f})" + tail)
+        return head + "，按当前放置执行"
 
     def _render_preview(self, compiled) -> None:
         """重画预览覆盖层：走线三色 + 内容 bbox/锚点 + 违规红点（快照外清掉）。

@@ -861,6 +861,15 @@ class LayoutPage(QtWidgets.QWidget):
         cb = getattr(self, "_sync_job_cb", None)
         if cb is not None and not cb.isChecked():
             return
+        # **D2-②：让作业页能看到「这份版面越不越界」**（不发信号、不弹框）。
+        # 越床判据**只存在于本页**的 :meth:`_out_of_bed`；作业页那边编出来的
+        # 是**放置之后**的几何，anchor 归位会把越界件整体拉回床内 ⇒
+        # ``compiled.bounds.violations`` 为空、作业页显示为干净可跑，而机器
+        # 切的位置已经和用户排版时看到的不一样了。作业页在
+        # ``_on_layout_job_sync`` 里**回头调本页的** ``_out_of_bed()`` 取判据
+        # （版面几何的真源在这儿，不复制一份到作业页去重算）。同步是高频
+        # 动作，故**不弹框** —— 告知由作业页显示，落点越界的拦截仍归
+        # ``compiled.runnable``（那条本来就有效）。
         self.job_sync_requested.emit(self.to_job_spec())
 
     def _on_page_add(self) -> None:

@@ -1568,7 +1568,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_console("排版已送去作业页 —— 检查预览后点『开始执行』")
 
     def _set_job_and_recompile(self, spec: JobSpec, *, from_layout: bool) -> bool:
-        """「换作业」= 赋 spec + 重编译，**原子**执行；编译不成则整体回滚。
+        """「换作业」= 赋 spec + 重编译，**原子**执行；真编译失败则整体回滚。
 
         缺陷（R8）：四条换作业路径原先都是「先 ``self._job_spec = spec``、
         再 :meth:`_recompile`」，而 :meth:`_recompile` 在参数非法时只打一行控制台
@@ -1585,15 +1585,61 @@ class MainWindow(QtWidgets.QMainWindow):
         会让后续一次静默同步把用户自己的文件作业顶掉（R6 的来源门禁靠它）。
         ``_job_lines``/``_job_compiled``/预览在失败路径上根本没被碰过，无需还原。
 
+        **回滚只针对「真编译失败」（D3）**：``_recompile`` 返回四态串，其中
+        ``"deferred"``（执行中 no-op）**不是失败** —— 它是仓库既有的
+        「本次作业结束后生效」延迟生效契约，:meth:`_on_job_done` 的补编译会
+        自然接住。旧实现把它一视同仁地回滚了 ⇒ 用户改的放置**永久蒸发**，
+        而下拉框还停在他选的那一项（界面对用户撒谎）。实测：执行中把 combo
+        切到「锚点归位」⇒ spec 仍是 preserve，jobDone 补编译后**仍是 preserve**。
+
+        处置按**改动性质**分（ask：读 ``_recompile`` 的返回值语义，别靠猜）：
+
+        ==============  ==================  ==============================
+        改动             ``paths_paper``    处置
+        ==============  ==================  ==============================
+        换作业           变了                **回滚**（spec 新 / 旧 lines = 半提交）
+        参数/口径        未变（同一份几何）  **不回滚**，留给 jobDone 补编译
+        ==============  ==================  ==============================
+
+        「放置」属第二类：它只是同一份几何的**放置方式**，几何多重集没变 ⇒
+        不存在 R8 说的半提交，而它恰是用户最需要「结束后生效」的那类改动。
+
+        **回滚时顺带还原下拉框**（ask 要求 2）：:meth:`_on_placement_changed`
+        是在 combo 变动后调本方法的，故 combo 已被用户改成新值；回滚 spec 而
+        不动 combo ⇒ 模型与 UI 再次分叉（同一处撒谎，只是换了个方向）。故回滚
+        后把 combo 拨回 spec 的实际放置方式（``_set_placement_ui`` 内部已
+        blockSignals，不会反过来再触发一次本方法）。
+
         返回 True = 真的重编译出了新 lines。
         """
         prev_spec, prev_from_layout = self._job_spec, self._job_from_layout
+        prev_placement = prev_spec.placement.mode if prev_spec is not None else None
         self._job_spec = spec
         self._job_from_layout = from_layout
-        if self._recompile():
+        outcome = self._recompile()
+        if outcome == "compiled":
             return True
+        if outcome == "deferred" and not self._job_geometry_changed(prev_spec, spec):
+            # 执行中 + 只是改放置/口径：几何没变 ⇒ 保留新 spec，jobDone 接住。
+            return False
         self._job_spec, self._job_from_layout = prev_spec, prev_from_layout
+        if prev_placement is not None and self._job_spec is not None:
+            # 回滚了模型就得让 UI 跟上，否则下拉框停在被回滚的那一项上。
+            self._set_placement_ui(self._job_spec.placement.mode)
         return False
+
+    @staticmethod
+    def _job_geometry_changed(prev: JobSpec | None, new: JobSpec) -> bool:
+        """换作业了吗（``paths_paper`` 有没有被换掉）。
+
+        判据用**几何多重集**（与切割口径一致）：长度不同、或任一段坐标不同
+        ⇒ 换作业。D3 处置分流的依据 —— 几何换了却不回滚就是 R8 的半提交。
+        """
+        if prev is None:
+            return True
+        a = [[tuple(pt) for pt in p] for p in prev.paths_paper]
+        b = [[tuple(pt) for pt in p] for p in new.paths_paper]
+        return a != b
 
     def _on_layout_job_sync(self, spec) -> None:
         """排版页**静默**同步作业预览（页切换等轻量动作，PRD §10.1-8）。
@@ -1884,7 +1930,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 
-    def _recompile(self) -> bool:
+    def _recompile(self) -> str:
         """唯一重编译汇流：JobSpec(内存唯一源) → compile_job → lines/预览。
 
         触发集：设/清工件原点、feed/Z 速度/跳段、去重/顺序/笔径、材料/切深/
@@ -1893,16 +1939,25 @@ class MainWindow(QtWidgets.QMainWindow):
         预览吃 compile 内 ``parse_lines(将发送的同一份 lines)`` 的 segments，
         worker 发同一份 lines —— 单一真源，无第二数据源。
 
-        返回**是否真的重编译出了新 lines**（R8）：执行中 no-op、无作业、参数
-        非法三条早退路径都返回 False，供 :meth:`_set_job_and_recompile` 决定
-        是否回滚刚赋的 spec。**触发集与成功路径语义一字未改**，只是多一个返回值
-        供调用方判断成败。
+        **返回四态字符串**（R8 补 D3）：早退/失败的原因**不同，处置也不同**，
+        混成一个 ``False`` 会让调用方把「延迟生效」误当「编译失败」而回滚。
+
+        - ``"compiled"``：真出了新 lines。
+        - ``"deferred"``：**执行中** no-op（本次作业结束后生效，:meth:`_on_job_done`
+          补编译接住）。**不是失败**——旧实现回滚它，用户改的放置永久蒸发
+          而下拉框还停在他选的那一项（D3）。
+        - ``"no-job"``：压根没有作业可编（``_job_spec is None``）。
+        - ``"failed"``：参数非法（Z 断言/域错误）⇒ 上一份 lines/预览保持不变。
+
+        ⚠ **触发集与各路径的行为一字未改**（执行中仍 no-op + 同一句提示、
+        失败仍保留上一份 lines）。只是把返回值从 ``bool`` 换成能区分原因的
+        四态串，让 :meth:`_set_job_and_recompile` 能正确决定回滚与否。
         """
         if self._job_running:
             self._append_console("执行中，参数改动本次作业结束后生效")
-            return False
+            return "deferred"
         if self._job_spec is None:
-            return False
+            return "no-job"
         try:
             # _spec_with_current_params 在 try 内：_current_zmap 的算术面
             # （cut_z_for_depth：touch_z < depth → 负 Z，§6 编译期拒绝）抛
@@ -1911,7 +1966,7 @@ class MainWindow(QtWidgets.QMainWindow):
             compiled = compile_job(spec, strict=False)
         except ValueError as exc:  # Z 断言/参数域错误：保持上一份 lines+预览
             self._append_console(f"编译失败（参数）：{exc}")
-            return False
+            return "failed"
         self._job_compiled = compiled
         self._job_spec = spec  # 参数投影同步回 spec（内存唯一源）
         self._job_lines = list(compiled.lines)
@@ -1920,7 +1975,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_gate_ui()  # 含 _update_run_btn + 对准/空跑按钮使能
         if compiled.bounds.violations:
             self._append_console("越界：" + "；".join(compiled.bounds.messages))
-        return True
+        return "compiled"
 
     def _spec_with_current_params(self) -> JobSpec:
         """字段（= JobSpec 参数投影，presets 依赖这些属性名）→ 当前参数的 spec。"""

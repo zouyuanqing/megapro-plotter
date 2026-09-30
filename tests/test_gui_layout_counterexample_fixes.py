@@ -6,10 +6,13 @@
     D1 之后 ``sceneBoundingRect()`` 是页面系、``gi.pos()`` 仍是父系，而
     ``pivot()`` 取后者、被拿去和页面系的 ``scene_pos`` 一起算 ``r0/r1``
     与旋转角。实测组 pos=(100,30) 时支点误差 **104.40mm**、抓可见角点拖到
-    两倍得 ``k=1.1497`` 而非 2.0。
-    ⚠ **本批修不了**（要改 ``handles.py``，无所有权）⇒ 下面用
-    ``xfail(strict=True)`` 钉住契约：将来有人改了 handles.py，它会 XPASS
-    逼人摘标记；在那之前它如实记录「仍坏着」。
+    两倍得 ``k=1.1497`` 而非 2.0；配套的 ``PathItem.page_to_parent`` 用
+    ``mapFromParent`` 实现（把自身 R·S 与 pos 一起逆了），round-trip 六种
+    场景全部返回 ``(0,0)`` —— 而钉它的三个 fixture 的 pos 恰好全为 (0,0)，
+    断言空洞（pos=(0,0) 时怎么实现都过）。
+    **已修**（handles + items 双侧）：单选支点走 ``page_origin()``、多选
+    页面系结果经 ``page_to_parent``（真 A⁻¹，解析求逆）换回父系再写 pos。
+    三个 fixture 的 pos 已改非零、祖先非恒等，round-trip 断言不再空洞。
 
 **R2**（``_layout_out_of_bed`` 只在静默同步那条路上被填）
     那条路被「同步作业预览」复选框把守 ⇒ 用户**关掉**它（真控件、tooltip
@@ -46,9 +49,9 @@ from megapro.gui.main_window import MainWindow               # noqa: E402
 
 # -- 工具 ------------------------------------------------------------------
 
-def _rect(name, x, y, w, h, z=0.0):
+def _rect(name, x, y, w, h, z=0.0, pos=(0.0, 0.0), **kw):
     return Item(paths=[[(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]],
-                pos=(0.0, 0.0), name=name, z=z)
+                pos=pos, name=name, z=z, **kw)
 
 
 def _page(*items):
@@ -126,13 +129,20 @@ def _move_out_of_bed(lp, blk, pos):
 
 
 # ============================================================================
-# R1：handles 支点与 D1 祖先变换不同框（本批修不了，xfail 钉契约）
+# R1：handles 支点与 page_to_parent 的坐标系（已修，转正）
 # ============================================================================
 
 def _grouped_page():
-    """组 pos=(100,30)，成员在组编辑态下成为操作单元（单选 ⇒ 走 pos() 分支）。"""
-    lp = _page(_rect("leaf", 0.0, 0.0, 10.0, 20.0, 1.0),
-               _rect("sib", 0.0, 60.0, 10.0, 20.0, 2.0))
+    """组 pos=(100,30)（**非恒等平移祖先**），叶子 pos 非零。
+
+    ⚠ 历史教训（F1）：本 fixture 旧版叶子 pos 恰好全为 (0,0) ⇒
+    「``page_to_parent(page_origin()) == pos``」恒真、round-trip 断言空洞。
+    现叶子 pos=(12,34)、sib pos=(5,5) —— pos=(0,0) 下巧合相等的实现
+    （``mapFromParent``）在这里会给出 (0,0) 而非 (12,34)。
+    组编辑态下单选叶子 ⇒ ``pivot()`` 走单选分支。
+    """
+    lp = _page(_rect("leaf", 0.0, 0.0, 10.0, 20.0, 1.0, pos=(12.0, 34.0)),
+               _rect("sib", 0.0, 60.0, 10.0, 20.0, 2.0, pos=(5.0, 5.0)))
     g = lp.doc.group_items([lp.doc.items[0], lp.doc.items[1]])
     g.pos = (100.0, 30.0)
     lp._rebuild_scene()
@@ -145,11 +155,11 @@ def _grouped_page():
     return lp, leaf, gi
 
 
-@pytest.mark.xfail(strict=True, reason="R1 未修：需改 canvas/handles.py（本批无所有权）")
 def test_r1_handles_pivot_is_in_page_space():
     """单选支点必须落在**画出来的**本地原点上（页面系），不是 ``pos()``。
 
-    修复前实测：pivot()=(0,0) 而本地图元画在 (100,30) ⇒ 误差 104.40mm。
+    错误实现下失败值：pivot = gi.pos() = (12,34)，画出来的原点 =
+    A((12,34)) = (112,64)（组平移 (100,30)）—— 误差向量 (100,30)。
     """
     lp, _leaf, gi = _grouped_page()
     drawn_origin = gi.mapToParent(QtCore.QPointF(0.0, 0.0))
@@ -161,35 +171,68 @@ def test_r1_handles_pivot_is_in_page_space():
             f"缩放/旋转的 r0、角度全错")
 
 
-@pytest.mark.xfail(strict=True, reason="R1 未修：需改 canvas/handles.py（本批无所有权）")
 def test_r1_drag_visible_corner_to_double_yields_k_two():
-    """抓**可见角点**拖到两倍大小 ⇒ k 必须是 2.0。
+    """抓**可见角点**拖到两倍大小 ⇒ k 必须是 2.0，角点落在用户放的位置。
 
-    修复前实测 k=1.1497（支点在父系 (0,0)，与可见角点 (110,50) 的距离比
-    被祖先偏移扭曲）。正确支点是画出来的本地原点 (100,30)。
+    手势按**用户意图**构造：抓住画出来的右下角（页面系 (122,84)），拖到
+    「可见支点（画出来的本地原点 (112,64)）两倍距离」处 (132,104)。
+    错误实现下失败值：支点停在父系 pos=(12,34) ⇒ r0=|(110,50)|、
+    r1=|(120,70)| ⇒ k=1.1497（≠2.0），切割角点落在 (123.5,87.0)
+    而非 (132,104) —— **机器按 1.15 倍切**。
     """
     import math
 
-    lp, _leaf, gi = _grouped_page()
+    lp, leaf, gi = _grouped_page()
+    g = lp.doc.items[0]
     lp._handles.sync([gi])
     r = gi.sceneBoundingRect()
-    near = (r.right(), r.bottom())
-    far = (near[0] + r.width(), near[1] + r.height())
+    near = (r.right(), r.bottom())                    # 页面系 (122,84)
+    drawn = gi.page_origin()                          # 页面系 (112,64)
+    far = (drawn.x() + 2 * (near[0] - drawn.x()),
+           drawn.y() + 2 * (near[1] - drawn.y()))     # (132,104)
     pivot = lp._handles.pivot()
     r0 = math.hypot(near[0] - pivot.x(), near[1] - pivot.y())
     r1 = math.hypot(far[0] - pivot.x(), far[1] - pivot.y())
     k = r1 / r0
     assert abs(k - 2.0) < 1e-6, f"拖到两倍应得 k=2.0，实得 {k}"
 
+    # 真 UI 手势走一遍（begin/update/end），模型必须兑现 k=2 且 pos 不被写歪
+    h = lp._handles
+    h.begin(h._handles[2], QtCore.QPointF(*near))
+    h.update_drag(h._handles[2], QtCore.QPointF(*far))
+    h.end(h._handles[2], QtCore.QPointF(*far))
+    assert abs(leaf.scale - 2.0) < 1e-6, \
+        f"model scale 应为 2.0，实得 {leaf.scale}（修复前 1.1497 —— 机器按 1.15 倍切）"
+    assert abs(leaf.pos[0] - 12.0) < 1e-6 and abs(leaf.pos[1] - 34.0) < 1e-6, \
+        f"单选缩放不该动 pos（父系字段），实得 {leaf.pos}"
+    # 切割侧回读（flatten 同一条 unit_paths 合成链）：可见角点必须落用户放的位置
+    from megapro.gui.layout.model import unit_paths as _up
+    pts = [p for poly in _up(leaf, (g,)) for p in poly]
+    cx, cy = max(p[0] for p in pts), max(p[1] for p in pts)
+    assert abs(cx - far[0]) < 1e-6 and abs(cy - far[1]) < 1e-6, (
+        f"切割角点 ({cx:.2f},{cy:.2f}) ≠ 用户放的 {far} "
+        f"（错误实现给 (123.50,86.99)）")
 
-@pytest.mark.xfail(strict=True, reason="R1 未修：需改 canvas/handles.py（本批无所有权）")
+
 def test_r1_multi_rotate_does_not_mix_frames():
-    """多选旋转：写回的父系 pos 不得混进页面系支点。
+    """多选旋转：写回的父系 pos 不得混进页面系支点（闭式泄漏必须为 0）。
 
-    修复前实测：祖先 pos=(30,20)、旋转 90° 后两版结果 x 差 50mm。
+    祖先平移 t=(30,20)，把手势转 +90°。**错误实现**把父系 pos 直接绕页面系
+    支点转 ⇒ 相对正确值泄漏恰好 ``t − R(t)``（对抗复核闭式）：
+    delta=+90° 时 = ``(t.x+t.y, t.y−t.x)`` = **(50,−10)**。
+    期望值在测试内用裸数学独立算出（纯平移祖先下 A⁻¹(p)=p−t），
+    不经 ``page_to_parent`` —— 不拿实现验证实现。
+
+    ⚠ 断言改写说明：本用例旧版（xfail 期）断的是「多选支点 == 叶子 a 的
+    页面原点」—— 与 handles.py 契约「多选支点 = 选择集并集中心」直接矛盾
+    （本 fixture 两叶并集中心 (42.5,40) ≠ 叶子 a 原点 (35,20)，修好了也不
+    成立）。多选支点的坐标系从来是对的（``selection_rect()`` 本就页面系），
+    真正混系的是**写回** —— 故转正时换成上面这条闭式断言。
     """
-    lp = _page(_rect("a", 0.0, 0.0, 20.0, 10.0, 1.0),
-               _rect("b", 0.0, 30.0, 20.0, 10.0, 2.0))
+    import math
+
+    lp = _page(_rect("a", 0.0, 0.0, 20.0, 10.0, 1.0, pos=(5.0, 0.0)),
+               _rect("b", 0.0, 30.0, 20.0, 10.0, 2.0, pos=(0.0, 15.0)))
     g = lp.doc.group_items([lp.doc.items[0], lp.doc.items[1]])
     g.pos = (30.0, 20.0)
     lp._rebuild_scene()
@@ -200,41 +243,93 @@ def test_r1_multi_rotate_does_not_mix_frames():
     for x in gis:
         x.setSelected(True)
     lp._on_selection_changed()
-    before = {it.name: it.pos for it in iter_ancestors(lp.doc.items) if not it.children
-              for it in [it]}
+    assert a.pos != (0.0, 0.0) and b.pos != (0.0, 0.0), "空洞守卫：pos 必须非零"
+
+    t = (30.0, 20.0)
     pivot = lp._handles.pivot()
-    origin = gis[0].mapToParent(QtCore.QPointF(0.0, 0.0))
-    assert abs(pivot.x() - origin.x()) < 1e-6 and \
-        abs(pivot.y() - origin.y()) < 1e-6, (
-            f"多选支点 {pivot.x():.2f},{pivot.y():.2f} 应在页面系 "
-            f"{origin.x():.2f},{origin.y():.2f}，否则旋转会把父系 pos 写歪")
-    del before
+    old_pos = {id(gi.model_item): gi.model_item.pos for gi in gis}
+    rot = next(h for h in lp._handles._handles if h.kind == "rotate")
+    # 把手转到 +90°：支点正右 → 支点正上
+    start = QtCore.QPointF(pivot.x() + 50.0, pivot.y())
+    end = QtCore.QPointF(pivot.x(), pivot.y() + 50.0)
+    lp._handles.begin(rot, start)
+    lp._handles.update_drag(rot, end)
+    lp._handles.end(rot, end)
+
+    rad = math.radians(90.0)
+    c, s = math.cos(rad), math.sin(rad)
+    for it in (a, b):
+        op = old_pos[id(it)]
+        # 正确值：页面系原点 op+t 绕支点转 90°，再换回父系（= 减 t）
+        want = (pivot.x() + (op[0] + t[0] - pivot.x()) * c
+                - (op[1] + t[1] - pivot.y()) * s - t[0],
+                pivot.y() + (op[0] + t[0] - pivot.x()) * s
+                + (op[1] + t[1] - pivot.y()) * c - t[1])
+        leak = (it.pos[0] - want[0], it.pos[1] - want[1])
+        assert abs(leak[0]) < 1e-6 and abs(leak[1]) < 1e-6, (
+            f"{it.name}: pos={it.pos} 应为 {want}，泄漏 {leak} —— "
+            f"错误实现恰好泄漏 (t.x+t.y, t.y−t.x) = (50,−10)")
 
 
-def test_r1_path_item_exposes_page_space_accessors():
-    """本批已交付的**使能半边**：PathItem 提供页面系原点与逆变换。
+# -- round-trip 矩阵：四种祖先 × 叶子自带变换（pos 全非零）------------------
 
-    ``page_origin()`` / ``page_to_parent()`` 是 handles 修正需要的两个入口
-    （把支点换到页面系、再把结果换回父系）。本条不钉行为正确性，只钉它们
-    存在且**与 pos() 的父系语义自洽**：空祖先链时 page_origin()==pos()、
-    page_to_parent 是逆运算。
+_LEAF_POS = (12.0, 34.0)
+_LEAF_OWN = dict(scale=1.5, angle_deg=30.0)
+
+#: 祖先形态 → 容器 mutator（None = 顶层空链）。六种场景同一叶子
+#: （pos=_LEAF_POS 非零、自带 scale=1.5/angle=30）。
+_ANCESTORS = {
+    "空链(顶层)": None,
+    "平移(100,30)": lambda g: setattr(g, "pos", (100.0, 30.0)),
+    "缩放2": lambda g: setattr(g, "scale", 2.0),
+    "旋转90": lambda g: setattr(g, "angle_deg", 90.0),
+    "镜像x": lambda g: setattr(g, "mirror_x", True),
+    "组合平移+旋转+缩放": lambda g: (setattr(g, "pos", (100.0, 30.0)),
+                                     setattr(g, "angle_deg", 90.0),
+                                     setattr(g, "scale", 2.0)),
+}
+
+
+def _leaf_with_ancestor(mutator):
+    leaf = _rect("leaf", 0.0, 0.0, 10.0, 20.0, 1.0, pos=_LEAF_POS, **_LEAF_OWN)
+    sib = _rect("sib", 0.0, 60.0, 10.0, 20.0, 2.0, pos=(5.0, 5.0))
+    lp = _page(leaf, sib)
+    if mutator is not None:
+        g = lp.doc.group_items([lp.doc.items[0], lp.doc.items[1]])
+        mutator(g)
+        lp._rebuild_scene()
+        lp._after_change()
+        leaf = lp.doc.items[0].children[0]
+        lp._enter_group_edit(leaf)
+    return lp, leaf, lp._gi_for(leaf)
+
+
+@pytest.mark.parametrize("label", list(_ANCESTORS))
+def test_r1_page_to_parent_round_trip_six_ancestor_kinds(label):
+    """round-trip：``page_to_parent(page_origin()) == pos``，六种祖先形态。
+
+    **空洞教训（F1）**：旧断言三个 fixture 的 pos 恰好全为 (0,0)，
+    ``mapFromParent`` 实现下 ``page_to_parent(page_origin()) = (R·S)⁻¹·0
+    = (0,0) = pos`` 恒真 —— 怎么实现都过。现 pos=(12,34) 非零、叶子自带
+    scale=1.5/angle=30：错误实现在**全部六种**场景（含空链！）返回
+    ``(0,0)``，断言以「期望 12/34、实得 0」具体失败 —— 实测见本轮探针。
     """
-    lp, _leaf, gi = _grouped_page()
-    # 有祖先时 page_origin != pos（这正是 R1 缺陷的量化）
+    lp, leaf, gi = _leaf_with_ancestor(_ANCESTORS[label])
+    assert leaf.pos != (0.0, 0.0), "空洞守卫：round-trip 断言要求 pos 非零"
+    # page_origin 仍是「本地图元本地原点的页面坐标」（D1 使能半边，不回归）
     drawn = gi.mapToParent(QtCore.QPointF(0.0, 0.0))
-    assert abs(gi.page_origin().x() - drawn.x()) < 1e-9, \
-        "page_origin() 应等于本地图元的页面原点"
-    # 逆运算：page_to_parent(page_origin) == pos
+    assert abs(gi.page_origin().x() - drawn.x()) < 1e-9 and \
+        abs(gi.page_origin().y() - drawn.y()) < 1e-9
     back = gi.page_to_parent(gi.page_origin())
-    assert abs(back.x() - gi.pos().x()) < 1e-6 and \
-        abs(back.y() - gi.pos().y()) < 1e-6, \
-        "page_to_parent 应是 page_origin 的逆运算"
-
-    # 顶层图元（空祖先链）两者相等
-    flat = _page(_rect("top", 5.0, 7.0, 3.0, 3.0, 1.0))
-    top_gi = flat._scene_items[0]
-    assert abs(top_gi.page_origin().x() - top_gi.pos().x()) < 1e-9, \
-        "空祖先链时 page_origin() 应逐位等于 pos()"
+    assert abs(back.x() - leaf.pos[0]) < 1e-6 and \
+        abs(back.y() - leaf.pos[1]) < 1e-6, (
+            f"[{label}] round-trip 应还原 pos={leaf.pos}，实得 "
+            f"({back.x():.4f},{back.y():.4f}) —— mapFromParent 实现恒给 (0,0)")
+    if _ANCESTORS[label] is None:
+        # 空祖先链必须**恒等**（不只是 round-trip）：任意页面点原样返回
+        q = QtCore.QPointF(37.5, -21.25)
+        assert gi.page_to_parent(q) == q, \
+            f"空链应恒等，实得 {gi.page_to_parent(q)}"
 
 
 # ============================================================================

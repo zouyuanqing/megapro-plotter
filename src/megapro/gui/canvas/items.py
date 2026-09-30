@@ -28,9 +28,10 @@
 实现因此仍是唯一来源）。
 
 ⚠ **``pos()`` 的语义不变，仍是父坐标系**：``commit_move`` 拿 ``gi.pos()``
-写回 ``it.pos``，``handles.pivot()`` 也按父系读它 —— 祖先偏移只进
-``setTransform``，绝不混进 ``pos``，否则回写会把页面坐标当父系坐标写进
-模型（一次拖动就把图元甩到床外）。
+写回 ``it.pos``，``handles.pivot()`` 的单选支点经 :meth:`page_origin` 换到
+页面系、多选结果经 :meth:`page_to_parent` 换回父系**才**写 ``pos`` ——
+祖先偏移只进 ``setTransform``，绝不混进 ``pos``，否则回写会把页面坐标当
+父系坐标写进模型（一次拖动就把图元甩到床外）。
 """
 
 from __future__ import annotations
@@ -175,13 +176,32 @@ class PathItem(QtWidgets.QGraphicsPathItem):
         return self.mapToParent(QtCore.QPointF(0.0, 0.0))
 
     def page_to_parent(self, point: QtCore.QPointF) -> QtCore.QPointF:
-        """页面（场景）坐标 → 本图元的**父系** ``pos`` 值。
+        """页面（场景）坐标 → 本图元的**父系** ``pos`` 值 = ``A⁻¹(point)``。
 
         :meth:`page_origin` 的逆运算，给「在页面系里算完、要写回父系」的场景
         用（手柄多选缩放/旋转就是：支点与鼠标都在页面系，算完必须换回来）。
-        空祖先链时恒等（顶层图元）。
+        空祖先链时恒等（顶层图元 round-trip == pos）。
+
+        **为什么不能走 ``mapFromParent``**（F1 对抗复核）：Qt 的
+        ``mapFromParent(q) = (R·S)⁻¹·M⁻¹·(q − pos)`` —— 它把**自身**的
+        旋转/缩放与 ``pos`` 一起逆掉了，给出的是「本地点」，不是「父系
+        ``pos`` 值」。两者仅在 ``pos=(0,0)`` 且自身无变换时巧合相等；实测
+        平移/缩放/旋转/镜像四种祖先 + 叶子自带 ``scale=1.5/angle=30`` 的
+        round-trip 全部返回 ``(0,0)`` 而非 ``pos``。故这里对 ``self._affine``
+        （只含祖先、不含自身变换，见 :func:`ancestor_affine`）的线性部分做
+        **解析求逆** —— ``_affine`` 本身由模型自己的合成数学反解而来，此处
+        只是 2×2 线性代数，不重写任何镜像/旋转算术。
+
+        ⚠ ``det ≈ 0``（祖先 scale≈0，几何已塌缩成线/点）时逆不存在，退回
+        恒等 —— 此刻场景上没有可拖的可见几何，手柄路径不会真用到这个值。
         """
-        return self.mapFromParent(point)
+        (a0x, a0y), ((a00, a10), (a01, a11)) = self._affine
+        det = a00 * a11 - a01 * a10
+        if abs(det) < 1e-12:
+            return QtCore.QPointF(point)
+        dx, dy = point.x() - a0x, point.y() - a0y
+        return QtCore.QPointF((a11 * dx - a01 * dy) / det,
+                              (a00 * dy - a10 * dx) / det)
 
     def _refresh_ancestor_transform(self) -> None:
         """按**当前** ``pos`` 重算并写入祖先矩阵 ``M``。

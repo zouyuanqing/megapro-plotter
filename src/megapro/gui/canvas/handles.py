@@ -5,7 +5,11 @@
   自由拉伸一律按 min 比例等比化）。
 - 缩放/旋转支点 = 本地原点（= pos，与 model 数学一致）；多选整体等比缩放
   ``scale_i' = k·scale_i``、``pos_i' = A + k·(pos_i − A)``（A = 选择集 bbox
-  锚点绝对坐标），保相对布局。
+  锚点绝对坐标），保相对布局。**坐标系纪律（F1/R1）**：手柄事件、支点、
+  选择框全是**页面系**，而 ``pos`` 是**父系**字段 —— 单选支点经
+  ``PathItem.page_origin()`` 进页面系，多选算出的页面系新原点经
+  ``PathItem.page_to_parent()``（A⁻¹）换回父系**才**写 ``pos``；空祖先链时
+  两者恒等，行为与引入祖先变换之前逐位相同。
 - 拖动中只临时 setScale/setRotation/setPos；``mouseRelease`` 一次性 push
   :class:`~megapro.gui.canvas.undo_cmds.ChangeItemPropsCommand`（old,new）。
 - 手柄恒定屏幕大小：``setScale(1/ppm)``（不用 ItemIgnoresTransformations
@@ -169,10 +173,19 @@ class SelectionHandles:
         return rect
 
     def pivot(self) -> QtCore.QPointF:
-        """缩放/旋转支点：单选 = pos（本地原点，与 model 数学一致）；多选 = 并集中心。"""
+        """缩放/旋转支点，**一律页面系**：单选 = ``page_origin()``（画出来的
+        本地原点，与 model 数学一致）；多选 = 并集中心。
+
+        ⚠ 单选**不能**读 ``gi.pos()``（F1/R1）：``pos`` 是**父系**字段，而
+        ``scene_pos`` 与 ``selection_rect()`` 都是页面系 —— 非恒等祖先下支点
+        与手柄实际摆放位置脱节，``r0/r1`` 与旋转角全错（实测组 pos=(100,30)
+        时支点误差 104.40mm、拖到两倍得 k=1.1497 而非 2.0）。
+        ``self._targets`` 只装 :class:`~megapro.gui.canvas.items.PathItem`
+        （``LayoutPage._selected`` 按 ``isinstance`` 过滤），``page_origin()``
+        恒可用。
+        """
         if len(self._targets) == 1:
-            p = self._targets[0].pos()
-            return QtCore.QPointF(p.x(), p.y())
+            return self._targets[0].page_origin()
         return self.selection_rect().center()
 
     # -- 拖动 ---------------------------------------------------------------
@@ -182,8 +195,13 @@ class SelectionHandles:
             "kind": handle.kind,
             "pivot": self.pivot(),
             "start": QtCore.QPointF(scene_pos),
+            # 每项多带一个「手势开始时的**页面系**原点」（gi.page_origin()）：
+            # 多选缩放/旋转要在页面系里围绕支点搬原点，而 update_drag 一跑
+            # ``gi.setPos`` 就把 pos 改了，届时再取 ``page_origin()``（= 活
+            # pos 过祖先仿射）拿到的已是中途值 —— 必须在 begin 一次取齐。
             "old": [(gi.model_item.pos, gi.model_item.scale, gi.model_item.angle_deg,
-                     QtCore.QPointF(gi.pos()), gi.scale(), gi.rotation())
+                     QtCore.QPointF(gi.pos()), gi.scale(), gi.rotation(),
+                     gi.page_origin())
                     for gi in self._targets],
         }
 
@@ -196,23 +214,48 @@ class SelectionHandles:
             a0 = math.atan2(d["start"].y() - pivot.y(), d["start"].x() - pivot.x())
             a1 = math.atan2(scene_pos.y() - pivot.y(), scene_pos.x() - pivot.x())
             delta = math.degrees(a1 - a0)
-            for gi, (_op, _os, oa, _osp, _osc, _orot) in zip(self._targets, d["old"]):
+            for gi, (_op, _os, oa, _osp, _osc, _orot, opage) in zip(
+                    self._targets, d["old"]):
                 gi.setRotation(oa + delta)
                 if len(self._targets) > 1:
-                    gi.setPos(self._rotated(QtCore.QPointF(*_op), pivot, delta))
+                    # 支点/手势/初始原点都在**页面系**；``pos`` 是父系字段，
+                    # 写回前必须经 ``page_to_parent``（= A⁻¹）换系 —— 直接把
+                    # 页面系结果写进 pos 就是 F1 的混系（实测祖先平移 (30,20)
+                    # 泄漏恰好 (t.x+t.y, t.y−t.x) = (50,−10)）。
+                    gi.setPos(gi.page_to_parent(self._rotated(opage, pivot, delta)))
+                    self._refresh_ancestor(gi)
         else:
             r0 = math.hypot(d["start"].x() - pivot.x(), d["start"].y() - pivot.y())
             r1 = math.hypot(scene_pos.x() - pivot.x(), scene_pos.y() - pivot.y())
             k = (r1 / r0) if r0 > 1e-9 else 1.0
             k = max(k, 1e-3)
-            for gi, (op, os_, _oa, osp, _osc, _orot) in zip(self._targets, d["old"]):
+            for gi, (op, os_, _oa, osp, _osc, _orot, opage) in zip(
+                    self._targets, d["old"]):
                 gi.setScale(os_ * k)
                 if len(self._targets) > 1:
-                    gi.setPos(QtCore.QPointF(
-                        pivot.x() + k * (osp.x() - pivot.x()),
-                        pivot.y() + k * (osp.y() - pivot.y())))
+                    # 同上：页面系里围绕支点缩放原点，换回父系再写 pos。
+                    gi.setPos(gi.page_to_parent(QtCore.QPointF(
+                        pivot.x() + k * (opage.x() - pivot.x()),
+                        pivot.y() + k * (opage.y() - pivot.y()))))
+                    self._refresh_ancestor(gi)
                 else:
+                    # 单选：支点 = 画出来的本地原点 ⇒ 缩放只动 scale，pos 不动
+                    # （model 数学：paths 绕本地原点缩放）。
                     gi.setPos(osp)
+
+    @staticmethod
+    def _refresh_ancestor(gi) -> None:
+        """``setPos`` 改了 pos 之后就地重算祖先矩阵 ``M``。
+
+        ``M = T(−pos)·A·T(pos)`` 与 pos 耦合（items._refresh_ancestor_transform），
+        手柄拖动的事件走的是手柄项、不经过 PathItem.mouseMoveEvent，不刷的话
+        拖动全程按旧 pos 共轭渲染 —— 非恒等祖先下图形与光标脱节。公有的
+        ``apply_model_state`` 会整份重设 scale/rotation/pos，会覆盖本手势已写的
+        临时值，故用这条窄通道。
+        """
+        refresh = getattr(gi, "_refresh_ancestor_transform", None)
+        if refresh is not None:
+            refresh()
 
     @staticmethod
     def _rotated(p: QtCore.QPointF, pivot: QtCore.QPointF,
@@ -230,7 +273,8 @@ class SelectionHandles:
             return
         self.update_drag(handle, scene_pos)
         changes = []
-        for gi, (op, os_, oa, _osp, _osc, _orot) in zip(self._targets, d["old"]):
+        for gi, (op, os_, oa, _osp, _osc, _orot, _opage) in zip(
+                self._targets, d["old"]):
             it = gi.model_item
             old = {"pos": op, "scale": os_, "angle_deg": oa}
             new = {

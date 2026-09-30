@@ -779,6 +779,8 @@ class LayoutPage(QtWidgets.QWidget):
     # 组级缩放/旋转同理：``SelectionHandles`` 的多选等比公式（``scale_i' =
     # k·scale_i``、``pos_i' = A + k(pos_i − A)``）已按选择集工作，选择集就是
     # 组叶子集 ⇒ 一条 ``ChangeItemPropsCommand``。二者都是**零新增渲染通路**。
+    # （坐标系纪律见 handles.py 头注（F1/R1）：公式在**页面系**里算，
+    # 写回 ``pos`` 前经 ``PathItem.page_to_parent`` 换回父系。）
 
     def _refresh_undo_actions(self) -> None:
         """把 undo/redo 的文案重写成「前缀 + 栈顶命令名」。
